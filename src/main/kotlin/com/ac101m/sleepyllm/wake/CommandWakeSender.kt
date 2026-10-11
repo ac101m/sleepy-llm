@@ -2,6 +2,8 @@ package com.ac101m.sleepyllm.wake
 
 import com.ac101m.sleepyllm.config.WakeConfig
 import org.slf4j.LoggerFactory
+import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 /**
  * [WakeSender] that shells out to a Wake-on-LAN utility, e.g. `wakeonlan aa:bb:cc:dd:ee:ff`
@@ -36,8 +38,49 @@ class CommandWakeSender(
     }
 
     companion object {
-        fun from(wake: WakeConfig): CommandWakeSender =
-            CommandWakeSender(buildCommand(wake))
+        fun from(wake: WakeConfig): CommandWakeSender {
+            // Fail fast: a proxy whose wake tool cannot run is dead weight — and
+            // without this, a missing binary only surfaces as a per-request 503.
+            verifyRunnable(wake.command)
+            return CommandWakeSender(buildCommand(wake))
+        }
+
+        /**
+         * Proves, at startup, that [tool] can actually be spawned (`--version`,
+         * falling back to `--help`, since wake-on-LAN tools differ in which flag
+         * they support). A spawn failure for both means the binary is absent from
+         * the PATH or not executable.
+         *
+         * Only spawn-ability is verified — a tool that runs but fails later (wrong
+         * MAC, unreachable subnet) still fails loudly at wake time. [spawn] is
+         * injectable purely for tests; the default spawns the real tool.
+         *
+         * Throws [IllegalStateException] so the proxy refuses to start, rather than
+         * echoing a misleading "backend is asleep" 503 for every request.
+         */
+        fun verifyRunnable(
+            tool: String,
+            timeoutMs: Long = 5_000L,
+            spawn: (List<String>) -> Process = { cmd -> ProcessBuilder(cmd).redirectErrorStream(true).start() },
+        ) {
+            fun probe(flag: String): Boolean = try {
+                val process = spawn(listOf(tool, flag))
+                try {
+                    process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+                } finally {
+                    process.destroyForcibly()
+                }
+            } catch (e: IOException) {
+                false
+            }
+
+            if (!probe("--version") && !probe("--help")) {
+                throw IllegalStateException(
+                    "wake command '$tool' could not be run: it is not on the PATH or is not executable." +
+                        " Install the wake tool on this host, or set wake.mode = \"dummy\""
+                )
+            }
+        }
 
         /**
          * Builds the wake command line: `command [-i subnet] mac`. The `-i` pair is

@@ -58,6 +58,11 @@ sleepyllm {
 }
 ```
 
+With `wake.mode = "command"`, Sleepy LLM verifies at startup that `wake.command`
+can be executed (via `--version` / `--help`) and refuses to start if the tool is
+missing from the PATH or not executable. `wake.mode = "dummy"` performs no such
+check.
+
 ## Roadmap
 
 - Idle-timeout shutdown of the backend (Wake-on-LAN can only wake; powering
