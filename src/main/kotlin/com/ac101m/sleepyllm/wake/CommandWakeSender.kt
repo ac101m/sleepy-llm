@@ -4,11 +4,14 @@ import com.ac101m.sleepyllm.config.WakeConfig
 import org.slf4j.LoggerFactory
 
 /**
- * [WakeSender] that shells out to a Wake-on-LAN utility, e.g. `wakeonlan aa:bb:cc:dd:ee:ff`.
+ * [WakeSender] that shells out to a Wake-on-LAN utility, e.g. `wakeonlan aa:bb:cc:dd:ee:ff`
+ * (or `wakeonlan -i <subnet> aa:bb:cc:dd:ee:ff` when a subnet is configured).
  *
  * The binary is resolved from [WakeConfig.command] and the machine's MAC address from
- * [WakeConfig.mac]. If the process exits non-zero the command's combined output is
- * included in the thrown exception so the failure is diagnosable in logs.
+ * [WakeConfig.mac]; [WakeConfig.subnet], when set, is passed via `-i` so the magic
+ * packet reaches the backend's subnet rather than the tool's default broadcast.
+ * If the process exits non-zero the command's combined output is included in the
+ * thrown exception so the failure is diagnosable in logs.
  */
 class CommandWakeSender(
     private val command: List<String>,
@@ -34,6 +37,21 @@ class CommandWakeSender(
 
     companion object {
         fun from(wake: WakeConfig): CommandWakeSender =
-            CommandWakeSender(listOf(wake.command, wake.mac))
+            CommandWakeSender(buildCommand(wake))
+
+        /**
+         * Builds the wake command line: `command [-i subnet] mac`. The `-i` pair is
+         * inserted only when [WakeConfig.subnet] is set, so a blank or unset subnet
+         * falls back to the wake tool's default broadcast address.
+         */
+        fun buildCommand(wake: WakeConfig): List<String> {
+            val args = mutableListOf(wake.command)
+            wake.subnet?.takeIf { it.isNotBlank() }?.let {
+                args += "-i"
+                args += it
+            }
+            args += wake.mac
+            return args
+        }
     }
 }

@@ -47,6 +47,12 @@ data class WakeConfig(
     val mode: WakeMode,
     val command: String,
     val mac: String,
+    /**
+     * Optional broadcast address (or interface) for `wakeonlan -i <subnet>`.
+     * Needed when the machine hosting the backend is on a different subnet;
+     * when null the wake tool's default broadcast (255.255.255.255) is used.
+     */
+    val subnet: String? = null,
 )
 
 object SleepyLlmConfigLoader {
@@ -74,6 +80,11 @@ object SleepyLlmConfigLoader {
                 mode = WakeMode.valueOf(root.getString("wake.mode").uppercase()),
                 command = root.getString("wake.command"),
                 mac = root.getString("wake.mac"),
+                subnet = if (root.hasPath("wake.subnet")) {
+                    root.getString("wake.subnet").trim().takeIf { it.isNotEmpty() }
+                } else {
+                    null
+                },
             ),
         )
     }

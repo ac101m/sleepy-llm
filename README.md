@@ -21,7 +21,8 @@ client ──► Sleepy LLM ──► wake on demand (Wake-on-LAN command / dumm
   arriving during a wake share the same in-flight wake — exactly one packet is
   sent, never one per request.
 - **Pluggable wake**: `wake.mode = "dummy"` does nothing (safe for development);
-  `wake.mode = "command"` runs `wakeonlan <mac>`.
+  `wake.mode = "command"` runs `wakeonlan <mac>`, with an optional `wake.subnet`
+  broadcast forwarded via `-i` for subnets other than the default.
 
 ## Building
 
@@ -48,6 +49,7 @@ sleepyllm {
   wake {
     mode = "command"          # or "dummy"
     command = "wakeonlan"     # binary resolved on PATH (or absolute path)
+    subnet = "192.168.10.255" # optional; broadcast passed to wakeonlan -i (needed across subnets)
     mac = "aa:bb:cc:dd:ee:ff" # the machine hosting the backend
   }
 }
