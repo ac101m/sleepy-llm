@@ -25,6 +25,7 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import io.ktor.server.testing.testApplication
+import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
@@ -41,19 +42,15 @@ class ProxyIntegrationTest {
         val server = embeddedServer(Netty, host = "127.0.0.1", port = 0) {
             routing {
                 get("/health") {
-                    val call = context
                     if (healthy) call.respondText("ok") else call.respond(HttpStatusCode.ServiceUnavailable, "booting")
                 }
                 get("/echo") {
-                    val call = context
                     call.respondText("hello path=${call.request.path()} x=${call.request.queryParameters["x"] ?: "-"}")
                 }
                 post("/echo") {
-                    val call = context
                     call.respondText("got:${call.receiveText()}")
                 }
                 get("/stream") {
-                    val call = context
                     call.respondBytesWriter(contentType = ContentType.Text.Plain) {
                         writeFully("part1".toByteArray(), 0, "part1".length)
                         flush()
@@ -70,7 +67,7 @@ class ProxyIntegrationTest {
             return this
         }
 
-        fun port(): Int = runBlocking { server.resolvedConnectors().first().port }
+        fun port(): Int = runBlocking { server.engine.resolvedConnectors().first().port }
 
         fun stop() = server.stop(100, 500)
     }

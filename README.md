@@ -26,11 +26,14 @@ client ──► Sleepy LLM ──► wake on demand (Wake-on-LAN command / dumm
 
 ## Building
 
-Requires JDK 8+ (Gradle 8.5 is pinned via the wrapper; it runs on JDK 8).
+Requires **JDK 21+** — both for Gradle itself (the Gradle 9.8 wrapper needs 17+;
+the build targets JVM 21 bytecode via a toolchain) and for running the fat jar
+on the deploy host. Set `JAVA_HOME` to a JDK 21+ install if it is not already.
 
 ```bash
-./gradlew build      # compile + test
-./gradlew run        # start the proxy with defaults
+./gradlew build       # compile + test
+./gradlew run         # start the proxy with defaults
+./gradlew shadowJar   # self-contained jar: build/libs/sleepy-llm-0.1.0-all.jar
 ```
 
 ## Configuration
@@ -59,4 +62,3 @@ sleepyllm {
 
 - Idle-timeout shutdown of the backend (Wake-on-LAN can only wake; powering
   down will require a separate mechanism, e.g. SSH).
-- Multiple backends / load balancing, TLS termination.

@@ -1,5 +1,6 @@
 plugins {
-    id 'org.jetbrains.kotlin.jvm' version '1.9.24'
+    id 'org.jetbrains.kotlin.jvm' version '2.4.21'
+    id 'com.gradleup.shadow' version '9.6.1'
     id 'application'
 }
 
@@ -11,35 +12,53 @@ repositories {
 }
 
 dependencies {
-    implementation platform('io.ktor:ktor-bom:2.3.12')
+    implementation platform('io.ktor:ktor-bom:3.6.0')
     implementation 'io.ktor:ktor-server-core-jvm'
     implementation 'io.ktor:ktor-server-netty-jvm'
     implementation 'io.ktor:ktor-client-core-jvm'
     implementation 'io.ktor:ktor-client-cio-jvm'
 
-    implementation 'com.typesafe:config:1.4.3'
-    implementation 'ch.qos.logback:logback-classic:1.3.14'
+    implementation 'com.typesafe:config:1.4.9'
+    implementation 'ch.qos.logback:logback-classic:1.6.5'
 
-    testImplementation 'org.jetbrains.kotlin:kotlin-test-junit5:1.9.24'
+    testImplementation 'org.jetbrains.kotlin:kotlin-test-junit5:2.4.21'
     testImplementation 'io.ktor:ktor-server-test-host-jvm'
-    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testImplementation 'org.junit.jupiter:junit-jupiter:6.1.3'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
+// Target the same major version the deploy host runs (JDK 21+). The toolchain
+// pins the JDK used for compilation/tests regardless of the JDK Gradle itself
+// runs on, so bytecode stays deterministic whatever JAVA_HOME is set to.
 kotlin {
     compilerOptions {
-        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8
-        freeCompilerArgs.add('-Xjvm-default=all')
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21
+        // Ktor 3.6 is built with default-method compatibility; with jvmTarget 21
+        // Kotlin emits JVM default methods without an explicit -jvm-default flag.
     }
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_1_8
-    targetCompatibility = JavaVersion.VERSION_1_8
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
 }
 
 application {
     mainClass = 'com.ac101m.sleepyllm.MainKt'
+}
+
+// Self-contained runnable jar for shipping to hosts that should not (or cannot)
+// run Gradle against this project — avoids the shared-cache file locking that
+// bites when the project lives on a multi-host mount. Run with: java -jar <file>
+shadowJar {
+    mergeServiceFiles()
+    // EXCLUDE would drop duplicate META-INF entries *before* the service-file and
+    // Kotlin-module transformers merge them. WARN lets every duplicate reach the
+    // transformers (correct merged output) while still reporting the resource names.
+    duplicatesStrategy = DuplicatesStrategy.WARN
 }
 
 tasks.withType(JavaCompile).configureEach {
