@@ -1,5 +1,6 @@
 package com.ac101m.sleepyllm.proxy
 
+import com.ac101m.sleepyllm.cache.ModelsCache
 import com.ac101m.sleepyllm.config.BackendConfig
 import com.ac101m.sleepyllm.config.HealthConfig
 import com.ac101m.sleepyllm.config.ProxyConfig
@@ -38,8 +39,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import java.io.File
+import java.nio.file.Files
 
 class ProxyIntegrationTest {
 
@@ -48,6 +52,10 @@ class ProxyIntegrationTest {
         @Volatile
         var healthy = false
 
+        /** Body served by the OpenAI-compatible models endpoint. */
+        @Volatile
+        var modelsBody = """{"object":"list","data":[{"id":"test-model","object":"model"}]}"""
+
         /** Blocks the /sse handler after its first event until the test releases it. */
         val sseBarrier = CompletableDeferred<Unit>()
 
@@ -55,6 +63,10 @@ class ProxyIntegrationTest {
             routing {
                 get("/health") {
                     if (healthy) call.respondText("ok") else call.respond(HttpStatusCode.ServiceUnavailable, "booting")
+                }
+                get("/v1/models") {
+                    if (healthy) call.respondText(modelsBody, ContentType.Application.Json)
+                    else call.respond(HttpStatusCode.ServiceUnavailable, "booting")
                 }
                 get("/echo") {
                     call.respondText("hello path=${call.request.path()} x=${call.request.queryParameters["x"] ?: "-"}")
@@ -109,13 +121,19 @@ class ProxyIntegrationTest {
         }
     }
 
-    private fun config(backendPort: Int, timeoutMs: Long) = SleepyLlmConfig(
+    private fun config(
+        backendPort: Int,
+        timeoutMs: Long,
+        healthPath: String = "/health",
+        modelsCacheFile: File? = null,
+    ) = SleepyLlmConfig(
         proxy = ProxyConfig(host = "127.0.0.1", port = 0),
         backend = BackendConfig(
             scheme = "http",
             host = "127.0.0.1",
             port = backendPort,
-            health = HealthConfig(path = "/health", timeoutMs = timeoutMs, pollIntervalMs = 20),
+            health = HealthConfig(path = healthPath, timeoutMs = timeoutMs, pollIntervalMs = 20),
+            modelsCacheFile = modelsCacheFile,
         ),
         wake = WakeConfig(mode = WakeMode.DUMMY, command = "wakeonlan", mac = "aa:bb:cc:dd:ee:ff"),
     )
@@ -279,6 +297,132 @@ class ProxyIntegrationTest {
 
                 val response = client.get("/echo")
                 assertEquals(HttpStatusCode.ServiceUnavailable, response.status)
+            }
+        } finally {
+            backend.stop()
+        }
+    }
+
+    @Test
+    fun `cached models copy is served without waking the backend`() = runBlocking {
+        val backend = FakeBackend().start() // never becomes healthy
+        val wake = DelayedWakeSender(onWake = {})
+        val cacheFile = Files.createTempFile("sleepy-models-", ".json").toFile()
+        // The cache is loaded at module construction, so prime it on disk first.
+        val cachedBody = """{"object":"list","data":[{"id":"cached-model"}]}"""
+        ModelsCache(cacheFile).write(cachedBody.toByteArray())
+        try {
+            testApplication {
+                application { module(config(backend.port(), 5_000, modelsCacheFile = cacheFile), wake) }
+                val client = createClient { }
+
+                val response = client.get("/v1/models")
+                assertEquals(HttpStatusCode.OK, response.status)
+                assertEquals("application/json", response.headers[HttpHeaders.ContentType])
+                assertEquals(cachedBody, response.bodyAsText())
+                assertEquals(0, wake.calls, "a cached /v1/models request must never wake the backend")
+            }
+        } finally {
+            backend.stop()
+        }
+    }
+
+    @Test
+    fun `ready backend forwards models live and refreshes the cache`() = runBlocking {
+        val backend = FakeBackend().apply { healthy = true }.start()
+        val wake = DelayedWakeSender(onWake = {})
+        val cacheFile = Files.createTempFile("sleepy-models-", ".json").toFile()
+        try {
+            testApplication {
+                application { module(config(backend.port(), 5_000, modelsCacheFile = cacheFile), wake) }
+                val client = createClient { }
+
+                // First request wakes (the lifecycle starts ASLEEP); afterwards the backend is READY.
+                assertEquals("hello path=/echo x=-", client.get("/echo").bodyAsText())
+                assertEquals(1, wake.calls)
+
+                // Simulate the server migrating to a new model while up.
+                val migrated = """{"object":"list","data":[{"id":"new-model","object":"model"}]}"""
+                backend.modelsBody = migrated
+
+                val response = client.get("/v1/models")
+                assertEquals(HttpStatusCode.OK, response.status)
+                assertEquals(migrated, response.bodyAsText(), "a READY backend must be forwarded live, not served from a stale cache")
+                assertEquals(1, wake.calls, "a READY backend must not be re-woken")
+
+                // The forward refreshed the on-disk cache.
+                assertContentEquals(migrated.toByteArray(), ModelsCache(cacheFile).read())
+            }
+        } finally {
+            backend.stop()
+        }
+    }
+
+    @Test
+    fun `cold models cache bootstraps via a single wake`() = runBlocking {
+        val backend = FakeBackend().start()
+        val wake = DelayedWakeSender(
+            onWake = { Thread({ Thread.sleep(150); backend.healthy = true }, "fake-wake").start() },
+        )
+        val cacheFile = Files.createTempFile("sleepy-models-", ".json").toFile()
+        try {
+            testApplication {
+                application { module(config(backend.port(), 5_000, modelsCacheFile = cacheFile), wake) }
+                val client = createClient { }
+
+                val response = client.get("/v1/models")
+                assertEquals(HttpStatusCode.OK, response.status)
+                assertEquals(backend.modelsBody, response.bodyAsText())
+                assertEquals(1, wake.calls, "a cold models cache should wake exactly once to bootstrap")
+                assertContentEquals(backend.modelsBody.toByteArray(), ModelsCache(cacheFile).read())
+            }
+        } finally {
+            backend.stop()
+        }
+    }
+
+    @Test
+    fun `health probe refreshes the cache when it targets v1 models`() = runBlocking {
+        val backend = FakeBackend().start()
+        val wake = DelayedWakeSender(
+            onWake = { Thread({ Thread.sleep(100); backend.healthy = true }, "fake-wake").start() },
+        )
+        val cacheFile = Files.createTempFile("sleepy-models-", ".json").toFile()
+        try {
+            testApplication {
+                // Health path equals /v1/models, so a successful probe populates the cache.
+                application {
+                    module(config(backend.port(), 5_000, healthPath = "/v1/models", modelsCacheFile = cacheFile), wake)
+                }
+                val client = createClient { }
+
+                assertEquals("hello path=/echo x=-", client.get("/echo").bodyAsText())
+                assertEquals(1, wake.calls)
+                assertContentEquals(
+                    backend.modelsBody.toByteArray(),
+                    ModelsCache(cacheFile).read(),
+                    "a healthy /v1/models probe should populate the cache",
+                )
+            }
+        } finally {
+            backend.stop()
+        }
+    }
+
+    @Test
+    fun `caching disabled wakes and forwards models like any request`() = runBlocking {
+        val backend = FakeBackend().apply { healthy = true }.start()
+        val wake = DelayedWakeSender(onWake = {})
+        try {
+            testApplication {
+                // modelsCacheFile defaults to null: feature off, today's behavior.
+                application { module(config(backend.port(), 5_000), wake) }
+                val client = createClient { }
+
+                val response = client.get("/v1/models")
+                assertEquals(HttpStatusCode.OK, response.status)
+                assertEquals(backend.modelsBody, response.bodyAsText())
+                assertEquals(1, wake.calls, "with caching disabled a models request wakes like any other")
             }
         } finally {
             backend.stop()

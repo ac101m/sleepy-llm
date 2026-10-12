@@ -27,9 +27,19 @@ data class BackendConfig(
     val host: String,
     val port: Int,
     val health: HealthConfig,
+    /**
+     * Where to persist the `/v1/models` response so the proxy can serve the model
+     * list without waking the backend. Null disables the cache (today's behavior).
+     */
+    val modelsCacheFile: File? = null,
 ) {
     /** Origin URL of the inference server, e.g. `http://127.0.0.1:8000`. */
     val baseUrl: String get() = "$scheme://$host:$port"
+
+    companion object {
+        /** OpenAI-compatible model-listing endpoint, also the default health-check path. */
+        const val MODELS_PATH = "/v1/models"
+    }
 }
 
 data class HealthConfig(
@@ -75,6 +85,13 @@ object SleepyLlmConfigLoader {
                     timeoutMs = root.getDuration("backend.health.timeout").toMillis(),
                     pollIntervalMs = root.getDuration("backend.health.poll-interval").toMillis(),
                 ),
+                modelsCacheFile = if (root.hasPath("backend.models-cache-file")) {
+                    root.getString("backend.models-cache-file").trim()
+                        .takeIf { it.isNotEmpty() }
+                        ?.let { File(it) }
+                } else {
+                    null
+                },
             ),
             wake = WakeConfig(
                 mode = WakeMode.valueOf(root.getString("wake.mode").uppercase()),

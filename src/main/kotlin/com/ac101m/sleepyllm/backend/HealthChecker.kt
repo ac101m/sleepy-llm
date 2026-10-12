@@ -3,10 +3,12 @@ package com.ac101m.sleepyllm.backend
 import com.ac101m.sleepyllm.config.BackendConfig
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
+import io.ktor.client.statement.bodyAsBytes
 import io.ktor.client.statement.bodyAsChannel
 import kotlinx.coroutines.delay
 import org.slf4j.LoggerFactory
 import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * Determines whether the inference server is ready to serve traffic.
@@ -25,7 +27,7 @@ class HealthChecker(private val probe: suspend () -> Boolean) {
         val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         while (System.nanoTime() < deadlineNanos) {
             if (probe()) return true
-            delay(pollIntervalMs)
+            delay(pollIntervalMs.milliseconds)
         }
         return probe()
     }
@@ -36,8 +38,18 @@ class HealthChecker(private val probe: suspend () -> Boolean) {
          * counts as healthy. Connect failures and non-2xx/3xx statuses are treated
          * as "not ready yet" (a server that is still booting usually refuses
          * connections or returns 503).
+         *
+         * @param onHealthyBody when non-null and the probe returns 2xx/3xx, the
+         *   response body is read fully and passed to this callback (instead of
+         *   being discarded) — used e.g. to refresh the `/v1/models` disk cache
+         *   from the health endpoint it is already fetching. When null the body is
+         *   cancelled and discarded as before.
          */
-        fun http(client: HttpClient, backend: BackendConfig): HealthChecker {
+        fun http(
+            client: HttpClient,
+            backend: BackendConfig,
+            onHealthyBody: ((ByteArray) -> Unit)? = null,
+        ): HealthChecker {
             val url = "${backend.baseUrl}${backend.health.path}"
             val logger = LoggerFactory.getLogger(HealthChecker::class.java)
             return HealthChecker {
@@ -46,8 +58,12 @@ class HealthChecker(private val probe: suspend () -> Boolean) {
                     val healthy = response.status.value in 200..399
                     if (!healthy) {
                         logger.info("health probe {} -> {} (not ready yet)", url, response.status.value)
+                        response.bodyAsChannel().cancel(cause = null)
+                    } else if (onHealthyBody != null) {
+                        onHealthyBody(response.bodyAsBytes())
+                    } else {
+                        response.bodyAsChannel().cancel(cause = null)
                     }
-                    response.bodyAsChannel().cancel(cause = null)
                     healthy
                 }.getOrDefault(false)
             }

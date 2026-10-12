@@ -12,6 +12,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.slf4j.LoggerFactory
 import java.io.Closeable
+import kotlin.time.Duration.Companion.milliseconds
 
 enum class BackendStatus {
     /** Backend is powered down; a request will trigger a wake. */
@@ -26,6 +27,12 @@ enum class BackendStatus {
 
 /** Abstraction over "wait until the backend can serve traffic". */
 interface ReadyWaiter {
+    /**
+     * Current backend state-machine status. READY means traffic is forwarded
+     * directly; ASLEEP/WAKING mean a request will trigger (or join) a wake.
+     */
+    val status: BackendStatus
+
     /**
      * Returns true once the backend is ready to serve, or false when it could not
      * be woken within the configured timeout. May block for the duration of a wake.
@@ -53,7 +60,7 @@ class BackendLifecycle(
     private val mutex = Mutex()
 
     @Volatile
-    var status: BackendStatus = BackendStatus.ASLEEP
+    override var status: BackendStatus = BackendStatus.ASLEEP
         private set
 
     private var pendingWake: CompletableDeferred<Boolean>? = null
@@ -107,7 +114,7 @@ class BackendLifecycle(
                     logger.info("wake signal sent to backend")
                 } catch (t: Throwable) {
                     logger.warn("wake attempt failed: {}", t.message)
-                    delay(wakeRetryDelayMs)
+                    delay(wakeRetryDelayMs.milliseconds)
                 }
             }
         }

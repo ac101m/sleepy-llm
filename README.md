@@ -23,6 +23,14 @@ client ──► Sleepy LLM ──► wake on demand (Wake-on-LAN command / dumm
 - **Pluggable wake**: `wake.mode = "dummy"` does nothing (safe for development);
   `wake.mode = "command"` runs `wakeonlan <mac>`, with an optional `wake.subnet`
   broadcast forwarded via `-i` for subnets other than the default.
+- **Cached model list**: `GET /v1/models` is answered from a disk cache whenever
+  the backend is not ready, so model-list polling never wakes the server. The
+  cache refreshes atomically on every successful `/v1/models` the proxy performs —
+  health probes (when `backend.health.path` defaults to `/v1/models`) and
+  forwarded client requests — and with a cold cache the first request wakes the
+  backend once to bootstrap it. While the backend is ready, the endpoint is
+  always forwarded live, so a server that swaps in a new model is reported
+  accurately. Set `backend.models-cache-file` to empty to disable.
 
 ## Building
 
@@ -48,6 +56,7 @@ sleepyllm {
   backend {
     host = "127.0.0.1", port = 8000
     health { path = "/v1/models", timeout = 60s, poll-interval = 1s }
+    models-cache-file = "./sleepy-llm-models.json" # optional; "" disables the /v1/models cache
   }
   wake {
     mode = "command"          # or "dummy"

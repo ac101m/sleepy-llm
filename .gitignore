@@ -12,3 +12,6 @@ build/
 
 # Local overrides
 /local-config.conf
+
+# Runtime state
+/sleepy-llm-models.json

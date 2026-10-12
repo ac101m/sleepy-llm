@@ -2,6 +2,8 @@ package com.ac101m.sleepyllm.proxy
 
 import com.ac101m.sleepyllm.backend.BackendLifecycle
 import com.ac101m.sleepyllm.backend.HealthChecker
+import com.ac101m.sleepyllm.cache.ModelsCache
+import com.ac101m.sleepyllm.config.BackendConfig
 import com.ac101m.sleepyllm.config.SleepyLlmConfig
 import com.ac101m.sleepyllm.wake.WakeSender
 import com.ac101m.sleepyllm.wake.WakeSenderFactory
@@ -38,13 +40,23 @@ fun Application.module(config: SleepyLlmConfig, wakeSender: WakeSender? = null) 
             requestTimeoutMillis = null
         }
     }
+    val modelsCache = config.backend.modelsCacheFile?.let { ModelsCache(it) }
     val lifecycle = BackendLifecycle(
         wakeSender = wakeSender ?: WakeSenderFactory.create(config.wake),
-        healthChecker = HealthChecker.http(client, config.backend),
+        healthChecker = HealthChecker.http(
+            client,
+            config.backend,
+            // Refresh the models cache from the health probe only when the probe
+            // really is the models endpoint; an overridden health path (e.g. /health)
+            // must not cache a non-models body.
+            onHealthyBody = modelsCache
+                ?.takeIf { config.backend.health.path == BackendConfig.MODELS_PATH }
+                ?.let { cache -> { body -> cache.write(body) } },
+        ),
         wakeTimeoutMs = config.backend.health.timeoutMs,
         pollIntervalMs = config.backend.health.pollIntervalMs,
     )
-    val proxy = SleepyProxy(client, config.backend, lifecycle)
+    val proxy = SleepyProxy(client, config.backend, lifecycle, modelsCache)
 
     intercept(ApplicationCallPipeline.ApplicationPhase.Call) {
         proxy.handle(this.context)
