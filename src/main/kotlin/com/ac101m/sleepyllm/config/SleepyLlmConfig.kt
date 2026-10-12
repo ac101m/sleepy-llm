@@ -32,6 +32,12 @@ data class BackendConfig(
      * list without waking the backend. Null disables the cache (today's behavior).
      */
     val modelsCacheFile: File? = null,
+    /**
+     * Down-detection of an externally shut-down backend while it is believed READY.
+     * Null disables the poller; the reactive hook (a forwarded request that cannot
+     * connect flips READY -> ASLEEP) is always active regardless.
+     */
+    val monitor: BackendMonitorConfig? = null,
 ) {
     /** Origin URL of the inference server, e.g. `http://127.0.0.1:8000`. */
     val baseUrl: String get() = "$scheme://$host:$port"
@@ -46,6 +52,20 @@ data class HealthConfig(
     val path: String,
     val timeoutMs: Long,
     val pollIntervalMs: Long,
+)
+
+/**
+ * Proactive down-detection of the backend while the proxy believes it is READY:
+ * probe the health endpoint every [intervalMs] and, after [downAfterFailures]
+ * consecutive failed probes, treat the backend as powered down (flip READY ->
+ * ASLEEP) so the next request wakes it on demand. Each probe is bounded by
+ * [timeoutMs] — kept short so a stale keep-alive connection to a dead backend
+ * cannot stall detection, and request-scoped so it never affects forwarded traffic.
+ */
+data class BackendMonitorConfig(
+    val intervalMs: Long,
+    val timeoutMs: Long,
+    val downAfterFailures: Int,
 )
 
 enum class WakeMode {
@@ -89,6 +109,15 @@ object SleepyLlmConfigLoader {
                     root.getString("backend.models-cache-file").trim()
                         .takeIf { it.isNotEmpty() }
                         ?.let { File(it) }
+                } else {
+                    null
+                },
+                monitor = if (root.hasPath("backend.monitor") && root.getBoolean("backend.monitor.enabled")) {
+                    BackendMonitorConfig(
+                        intervalMs = root.getDuration("backend.monitor.interval").toMillis(),
+                        timeoutMs = root.getDuration("backend.monitor.timeout").toMillis(),
+                        downAfterFailures = root.getInt("backend.monitor.failures"),
+                    )
                 } else {
                     null
                 },

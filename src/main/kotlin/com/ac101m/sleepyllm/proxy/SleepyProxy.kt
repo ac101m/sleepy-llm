@@ -5,6 +5,7 @@ import com.ac101m.sleepyllm.backend.ReadyWaiter
 import com.ac101m.sleepyllm.cache.ModelsCache
 import com.ac101m.sleepyllm.config.BackendConfig
 import io.ktor.client.HttpClient
+import io.ktor.client.engine.cio.FailToConnectException
 import io.ktor.client.request.prepareRequest
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
@@ -29,6 +30,8 @@ import io.ktor.server.request.uri
 import io.ktor.server.response.respond
 import io.ktor.utils.io.ByteReadChannel
 import org.slf4j.LoggerFactory
+import java.net.SocketException
+import java.net.UnknownHostException
 
 /**
  * Application-level reverse proxy: forwards every request to the configured
@@ -89,17 +92,56 @@ class SleepyProxy(
         try {
             forward(call)
         } catch (t: Throwable) {
-            logger.error(
-                "proxy error for {} {}",
-                call.request.httpMethod,
-                call.request.uri,
-                t,
-            )
+            if (isConnectionFailure(t)) {
+                // The backend was believed READY but a forward could not reach it —
+                // likely powered off by another actor. Flip it back to ASLEEP so the
+                // next request wakes it again. The client still gets the 502; waking
+                // the dead backend here is pointless and would race other state.
+                logger.warn(
+                    "backend unreachable for {} {}: {} — marking it ASLEEP so the next request retries the wake",
+                    call.request.httpMethod,
+                    call.request.uri,
+                    t.message,
+                )
+                lifecycle.onBackendUnreachable()
+            } else {
+                logger.error(
+                    "proxy error for {} {}",
+                    call.request.httpMethod,
+                    call.request.uri,
+                    t,
+                )
+            }
             return call.respond(
                 HttpStatusCode.BadGateway,
                 "Sleepy LLM could not reach the backend: ${t.message ?: t::class.simpleName}",
             )
         }
+    }
+
+    /**
+     * Whether a thrown forward represents a connection-level failure — the backend
+     * refused a connection, timed out, reset a stale keep-alive connection (the usual
+     * first symptom after it is powered off), or could not be resolved — as opposed
+     * to a proxy-side or protocol error. Walks the cause chain because Ktor
+     * occasionally wraps the underlying socket I/O error. HTTP error statuses never
+     * throw out of [forward], so they never reach this classifier.
+     *
+     * [SocketException] covers refused connects ([java.net.ConnectException]), the
+     * Ktor engine's connect-timeout (which extends it) and connection resets in one
+     * check; qualifying on it rather than only `ConnectException` is what catches a
+     * powered-off backend the moment the first forwarded request reuses a dead
+     * pooled connection.
+     */
+    private fun isConnectionFailure(t: Throwable): Boolean {
+        var current: Throwable? = t
+        while (current != null) {
+            if (current is SocketException) return true
+            if (current is UnknownHostException) return true
+            if (current is FailToConnectException) return true
+            current = current.cause
+        }
+        return false
     }
 
     /**

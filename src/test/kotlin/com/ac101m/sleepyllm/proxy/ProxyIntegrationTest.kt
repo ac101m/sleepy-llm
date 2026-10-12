@@ -2,6 +2,7 @@ package com.ac101m.sleepyllm.proxy
 
 import com.ac101m.sleepyllm.cache.ModelsCache
 import com.ac101m.sleepyllm.config.BackendConfig
+import com.ac101m.sleepyllm.config.BackendMonitorConfig
 import com.ac101m.sleepyllm.config.HealthConfig
 import com.ac101m.sleepyllm.config.ProxyConfig
 import com.ac101m.sleepyllm.config.SleepyLlmConfig
@@ -126,6 +127,7 @@ class ProxyIntegrationTest {
         timeoutMs: Long,
         healthPath: String = "/health",
         modelsCacheFile: File? = null,
+        monitor: BackendMonitorConfig? = null,
     ) = SleepyLlmConfig(
         proxy = ProxyConfig(host = "127.0.0.1", port = 0),
         backend = BackendConfig(
@@ -134,6 +136,7 @@ class ProxyIntegrationTest {
             port = backendPort,
             health = HealthConfig(path = healthPath, timeoutMs = timeoutMs, pollIntervalMs = 20),
             modelsCacheFile = modelsCacheFile,
+            monitor = monitor,
         ),
         wake = WakeConfig(mode = WakeMode.DUMMY, command = "wakeonlan", mac = "aa:bb:cc:dd:ee:ff"),
     )
@@ -423,6 +426,85 @@ class ProxyIntegrationTest {
                 assertEquals(HttpStatusCode.OK, response.status)
                 assertEquals(backend.modelsBody, response.bodyAsText())
                 assertEquals(1, wake.calls, "with caching disabled a models request wakes like any other")
+            }
+        } finally {
+            backend.stop()
+        }
+    }
+
+    @Test
+    fun `a request that fails to connect marks a ready backend asleep`() = runBlocking {
+        val backend = FakeBackend().apply { healthy = true }.start()
+        val wake = DelayedWakeSender(onWake = {})
+        try {
+            testApplication {
+                // monitor = null means the poller is off: only the reactive hook can
+                // flip READY -> ASLEEP. (A poller might flip first and turn the
+                // asserted 502 below into a 503 instead.)
+                application { module(config(backend.port(), 200, monitor = null), wake) }
+                val client = createClient { }
+
+                assertEquals(HttpStatusCode.OK, client.get("/echo").status)
+                assertEquals(1, wake.calls)
+
+                backend.stop()
+                delay(200) // let the engine release the port deterministically
+
+                val second = client.get("/echo")
+                assertEquals(
+                    HttpStatusCode.BadGateway,
+                    second.status,
+                    "a request that fails to connect to a dead backend should return 502",
+                )
+                assertEquals(1, wake.calls, "the failed connect must not itself fire a wake")
+
+                val third = client.get("/echo")
+                assertEquals(
+                    HttpStatusCode.ServiceUnavailable,
+                    third.status,
+                    "after the flip, the next request takes the wake path instead of forwarding",
+                )
+                assertEquals(2, wake.calls, "the next request must re-attempt the wake")
+            }
+        } finally {
+            backend.stop()
+        }
+    }
+
+    @Test
+    fun `poller marks the backend asleep while idle after it goes down`() = runBlocking {
+        val backend = FakeBackend().apply { healthy = true }.start()
+        val wake = DelayedWakeSender(onWake = {})
+        try {
+            testApplication {
+                application {
+                    module(
+                        config(
+                            backend.port(),
+                            200,
+                            monitor = BackendMonitorConfig(intervalMs = 20, timeoutMs = 100, downAfterFailures = 3),
+                        ),
+                        wake,
+                    )
+                }
+                val client = createClient { }
+
+                assertEquals(HttpStatusCode.OK, client.get("/echo").status)
+                assertEquals(1, wake.calls)
+
+                backend.stop()
+                // No requests: only the idle poller can notice the backend went down.
+                delay(1_000)
+
+                val response = client.get("/echo")
+                assertEquals(
+                    HttpStatusCode.ServiceUnavailable,
+                    response.status,
+                    "an idle-detected down backend takes the wake path on the next request",
+                )
+                // Had the poller not flipped READY -> ASLEEP while idle, this request
+                // would have forwarded and returned 502 with wake.calls still 1.
+                assertEquals(2, wake.calls, "the idle poller must have marked the backend down")
             }
         } finally {
             backend.stop()

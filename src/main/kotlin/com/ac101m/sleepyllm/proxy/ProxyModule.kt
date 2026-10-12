@@ -41,6 +41,7 @@ fun Application.module(config: SleepyLlmConfig, wakeSender: WakeSender? = null) 
         }
     }
     val modelsCache = config.backend.modelsCacheFile?.let { ModelsCache(it) }
+    val monitor = config.backend.monitor
     val lifecycle = BackendLifecycle(
         wakeSender = wakeSender ?: WakeSenderFactory.create(config.wake),
         healthChecker = HealthChecker.http(
@@ -55,6 +56,15 @@ fun Application.module(config: SleepyLlmConfig, wakeSender: WakeSender? = null) 
         ),
         wakeTimeoutMs = config.backend.health.timeoutMs,
         pollIntervalMs = config.backend.health.pollIntervalMs,
+        monitorProbe = monitor?.let { m ->
+            // Dedicated probe for the READY-state monitor: a short per-probe
+            // deadline so a stale keep-alive connection cannot stall detection, and
+            // onHealthyBody is null so probing never writes the models cache to disk
+            // once per second.
+            HealthChecker.http(client, config.backend, probeTimeoutMs = m.timeoutMs)::isHealthy
+        },
+        monitorIntervalMs = monitor?.intervalMs,
+        downAfterFailures = monitor?.downAfterFailures ?: 3,
     )
     val proxy = SleepyProxy(client, config.backend, lifecycle, modelsCache)
 
