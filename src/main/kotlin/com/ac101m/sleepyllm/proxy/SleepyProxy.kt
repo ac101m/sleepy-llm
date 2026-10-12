@@ -96,7 +96,12 @@ class SleepyProxy(
         val incoming = call.request
         val requestBody = call.receiveChannel()
 
-        val response = client.prepareRequest {
+        // Streaming block form of execute() — Ktor's plain execute() downloads
+        // the whole response into memory before returning (it runs the default
+        // SaveBody plugin), which would hang forever on a live SSE stream that
+        // stays open while tokens are produced. The block form skips body saving,
+        // so the response channel stays live and is forwarded as it arrives.
+        client.prepareRequest {
             method = incoming.httpMethod
             url {
                 protocol = URLProtocol.HTTP
@@ -114,17 +119,19 @@ class SleepyProxy(
                 override val contentLength: Long? = incoming.contentLength()
                 override fun readFrom(): ByteReadChannel = requestBody
             })
-        }.execute()
+        }.execute { response ->
+            // Capture the streaming body channel eagerly (the non-suspend readFrom()
+            // cannot call the suspend bodyAsChannel() itself). call.respond suspends
+            // until the whole stream has been forwarded, so the block-form cleanup
+            // runs only after the caller has received everything.
+            val responseBody = response.bodyAsChannel()
 
-        // Capture the streaming body channel eagerly (the non-suspend readFrom()
-        // cannot call the suspend bodyAsChannel() itself).
-        val responseBody = response.bodyAsChannel()
-
-        call.respond(object : OutgoingContent.ReadChannelContent() {
-            override val status: HttpStatusCode = response.status
-            override val headers: Headers = response.headers.copyExcluding(excludedResponseHeaders)
-            override fun readFrom(): ByteReadChannel = responseBody
-        })
+            call.respond(object : OutgoingContent.ReadChannelContent() {
+                override val status: HttpStatusCode = response.status
+                override val headers: Headers = response.headers.copyExcluding(excludedResponseHeaders)
+                override fun readFrom(): ByteReadChannel = responseBody
+            })
+        }
     }
 
     private fun Headers.copyExcluding(excluded: Set<String>): Headers {
