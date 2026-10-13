@@ -5,6 +5,8 @@ import com.ac101m.sleepyllm.backend.HealthChecker
 import com.ac101m.sleepyllm.cache.ModelsCache
 import com.ac101m.sleepyllm.config.BackendConfig
 import com.ac101m.sleepyllm.config.SleepyLlmConfig
+import com.ac101m.sleepyllm.shutdown.CommandShutdownHandler
+import com.ac101m.sleepyllm.shutdown.ShutdownHandler
 import com.ac101m.sleepyllm.wake.WakeSender
 import com.ac101m.sleepyllm.wake.WakeSenderFactory
 import io.ktor.client.HttpClient
@@ -23,8 +25,15 @@ import io.ktor.server.application.ApplicationStopped
  *
  * @param wakeSender an optional override, used by tests to substitute the real
  *   (or dummy) wake implementation with a controllable fake.
+ * @param shutdownHandler an optional override of the idle-shutdown actor, used by
+ *   tests to substitute a controllable fake; when null and `config.shutdown` is
+ *   set, the real command-based handler is built from the config.
  */
-fun Application.module(config: SleepyLlmConfig, wakeSender: WakeSender? = null) {
+fun Application.module(
+    config: SleepyLlmConfig,
+    wakeSender: WakeSender? = null,
+    shutdownHandler: ShutdownHandler? = null,
+) {
     val client = HttpClient(CIO) {
         // A reverse proxy must not impose a request deadline on the backend:
         // a token-streaming (SSE) response can legitimately stay open for
@@ -42,6 +51,7 @@ fun Application.module(config: SleepyLlmConfig, wakeSender: WakeSender? = null) 
     }
     val modelsCache = config.backend.modelsCacheFile?.let { ModelsCache(it) }
     val monitor = config.backend.monitor
+    val shutdown = config.shutdown
     val lifecycle = BackendLifecycle(
         wakeSender = wakeSender ?: WakeSenderFactory.create(config.wake),
         healthChecker = HealthChecker.http(
@@ -65,6 +75,9 @@ fun Application.module(config: SleepyLlmConfig, wakeSender: WakeSender? = null) 
         },
         monitorIntervalMs = monitor?.intervalMs,
         downAfterFailures = monitor?.downAfterFailures ?: 3,
+        idleTimeoutMs = shutdown?.idleTimeoutMs,
+        shutdownPollIntervalMs = shutdown?.pollIntervalMs ?: 60_000L,
+        shutdownHandler = shutdownHandler ?: shutdown?.let(CommandShutdownHandler::from),
     )
     val proxy = SleepyProxy(client, config.backend, lifecycle, modelsCache)
 

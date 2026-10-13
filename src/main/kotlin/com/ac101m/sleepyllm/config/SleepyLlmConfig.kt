@@ -15,6 +15,11 @@ data class SleepyLlmConfig(
     val proxy: ProxyConfig,
     val backend: BackendConfig,
     val wake: WakeConfig,
+    /**
+     * Idle shutdown of the machine hosting the backend. Null (or unset) disables
+     * the feature: the proxy may wake the machine but will never power it down.
+     */
+    val shutdown: ShutdownConfig? = null,
 )
 
 data class ProxyConfig(
@@ -68,6 +73,25 @@ data class BackendMonitorConfig(
     val downAfterFailures: Int,
 )
 
+/**
+ * Idle shutdown of the backend machine: after [idleTimeoutMs] with no real
+ * traffic (and, when [checkCommand] is set, no logged-in users), run [command]
+ * to power it down. The next request then wakes it again via the normal path.
+ */
+data class ShutdownConfig(
+    val idleTimeoutMs: Long,
+    /** How often the idle loop re-checks the login guard and the idle clock while READY. */
+    val pollIntervalMs: Long,
+    /** Power-off command as argv, e.g. `["ssh", "user@host", "sudo", "poweroff"]`. */
+    val command: List<String>,
+    /**
+     * Optional guard command: exit 0 = nobody is logged in (safe to shut down),
+     * non-zero = someone is logged in (defer). Null means the proxy assumes full
+     * control of the lifecycle and shuts the machine down on idle alone.
+     */
+    val checkCommand: List<String>? = null,
+)
+
 enum class WakeMode {
     DUMMY,
     COMMAND,
@@ -75,14 +99,14 @@ enum class WakeMode {
 
 data class WakeConfig(
     val mode: WakeMode,
-    val command: String,
-    val mac: String,
     /**
-     * Optional broadcast address (or interface) for `wakeonlan -i <subnet>`.
-     * Needed when the machine hosting the backend is on a different subnet;
-     * when null the wake tool's default broadcast (255.255.255.255) is used.
+     * The wake command, as argv, run verbatim via ProcessBuilder with no shell —
+     * exactly like the shutdown command. The MAC address, broadcast/interface
+     * flags and any tool-specific options are all part of this list, e.g.
+     * `["wakeonlan", "-i", "192.168.10.255", "aa:bb:cc:dd:ee:ff"]`; the proxy does
+     * not assemble them. Only used when [mode] is COMMAND.
      */
-    val subnet: String? = null,
+    val command: List<String>,
 )
 
 object SleepyLlmConfigLoader {
@@ -122,16 +146,28 @@ object SleepyLlmConfigLoader {
                     null
                 },
             ),
-            wake = WakeConfig(
-                mode = WakeMode.valueOf(root.getString("wake.mode").uppercase()),
-                command = root.getString("wake.command"),
-                mac = root.getString("wake.mac"),
-                subnet = if (root.hasPath("wake.subnet")) {
-                    root.getString("wake.subnet").trim().takeIf { it.isNotEmpty() }
-                } else {
-                    null
-                },
-            ),
+            wake = run {
+                val mode = WakeMode.valueOf(root.getString("wake.mode").uppercase())
+                val command = root.getStringList("wake.command")
+                require(mode != WakeMode.COMMAND || command.isNotEmpty()) {
+                    "wake.mode = \"command\" requires wake.command (a list of argv) to be set; or set wake.mode = \"dummy\""
+                }
+                WakeConfig(mode, command)
+            },
+            shutdown = if (root.hasPath("shutdown") && root.getBoolean("shutdown.enabled")) {
+                val command = root.getStringList("shutdown.command")
+                require(command.isNotEmpty()) {
+                    "shutdown.enabled = true requires shutdown.command (a list of argv) to be set"
+                }
+                ShutdownConfig(
+                    idleTimeoutMs = root.getDuration("shutdown.idle-timeout").toMillis(),
+                    pollIntervalMs = root.getDuration("shutdown.poll-interval").toMillis(),
+                    command = command,
+                    checkCommand = root.getStringList("shutdown.check-command").takeIf { it.isNotEmpty() },
+                )
+            } else {
+                null
+            },
         )
     }
 

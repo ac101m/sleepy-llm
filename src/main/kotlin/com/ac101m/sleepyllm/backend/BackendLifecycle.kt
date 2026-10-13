@@ -1,5 +1,6 @@
 package com.ac101m.sleepyllm.backend
 
+import com.ac101m.sleepyllm.shutdown.ShutdownHandler
 import com.ac101m.sleepyllm.wake.WakeSender
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -14,6 +15,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.slf4j.LoggerFactory
 import java.io.Closeable
+import java.util.concurrent.TimeUnit
 import kotlin.time.Duration.Companion.milliseconds
 
 enum class BackendStatus {
@@ -48,6 +50,16 @@ interface ReadyWaiter {
      * currently READY (avoids racing an in-flight wake).
      */
     suspend fun onBackendUnreachable()
+
+    /**
+     * Records that real traffic was forwarded to the backend. Resets the
+     * idle-shutdown clock so an active (or recently active) backend is never
+     * powered off. The proxy excludes `/v1/models` — the model-listing endpoint a
+     * polling dashboard hits — so that traffic does not count as activity. The
+     * default implementation does nothing, keeping the idle clock off for
+     * implementations that do not opt in.
+     */
+    fun onBackendActivity() {}
 }
 
 /**
@@ -63,6 +75,13 @@ interface ReadyWaiter {
  * [onBackendUnreachable] provides the same flip when a forwarded request fails to
  * connect. Detection is passive — it never fires a wake itself; the next
  * [awaitReady] request does that via the wake path above.
+ *
+ * The proxy is similarly a participant in the *other* direction of the cycle:
+ * when idle shutdown is configured ([idleTimeoutMs] + [shutdownHandler]), an
+ * idle loop tracks real traffic ([onBackendActivity]) and observed logins
+ * (via the handler's guard) and, once the backend has been quiet for the window,
+ * powers it down ([startIdleShutdown]) — again flipping to ASLEEP so the next
+ * request wakes it on demand.
  */
 class BackendLifecycle(
     private val wakeSender: WakeSender,
@@ -77,6 +96,12 @@ class BackendLifecycle(
     private val monitorIntervalMs: Long? = null,
     /** Consecutive failed probes before a READY backend is declared ASLEEP. */
     private val downAfterFailures: Int = 3,
+    /** Idle-shutdown window; null disables the idle-shutdown feature entirely. */
+    private val idleTimeoutMs: Long? = null,
+    /** How often the idle loop re-checks the login guard and the idle clock. */
+    private val shutdownPollIntervalMs: Long = 60_000L,
+    /** Optional login guard + power-off command; used only when [idleTimeoutMs] is set. */
+    private val shutdownHandler: ShutdownHandler? = null,
 ) : ReadyWaiter, Closeable {
 
     private val logger = LoggerFactory.getLogger(BackendLifecycle::class.java)
@@ -91,6 +116,22 @@ class BackendLifecycle(
 
     /** Running READY-state monitor, if any. Only modified under [mutex]. */
     private var monitorJob: Job? = null
+
+    /**
+     * Time (monotonic [System.nanoTime]) of the last real forwarded request or
+     * observed login; the idle-shutdown clock counts down from it. Written by
+     * [onBackendActivity] without the mutex — a plain volatile write — and read
+     * afresh each idle-loop tick.
+     */
+    @Volatile
+    private var lastActivityNanos: Long = 0L
+
+    /** Running idle-shutdown loop, if any. Only modified under [mutex]. */
+    private var idleShutdownJob: Job? = null
+
+    override fun onBackendActivity() {
+        lastActivityNanos = System.nanoTime()
+    }
 
     override suspend fun awaitReady(): Boolean {
         if (status == BackendStatus.READY) return true
@@ -124,17 +165,27 @@ class BackendLifecycle(
             if (status == BackendStatus.READY) {
                 logger.warn("backend marked ASLEEP: {}", reason)
                 status = BackendStatus.ASLEEP
-                monitorJob?.cancel()
-                monitorJob = null
+                stopReadyJobs()
             }
         }
     }
 
-    private fun beginWake(): CompletableDeferred<Boolean> {
-        // Belt and suspenders: every path that leaves READY already cancels the
-        // monitor, so this only guards against unexpected interleavings.
+    /**
+     * Cancels and clears the READY-state background jobs (readiness monitor and
+     * idle-shutdown loop). Only ever called under [mutex], always at a point where
+     * status is leaving READY — so neither job can run against a non-READY backend.
+     */
+    private fun stopReadyJobs() {
         monitorJob?.cancel()
         monitorJob = null
+        idleShutdownJob?.cancel()
+        idleShutdownJob = null
+    }
+
+    private fun beginWake(): CompletableDeferred<Boolean> {
+        // Belt and suspenders: every path that leaves READY already cancels the
+        // background jobs, so this only guards against unexpected interleavings.
+        stopReadyJobs()
         status = BackendStatus.WAKING
         val deferred = CompletableDeferred<Boolean>()
         pendingWake = deferred
@@ -150,13 +201,14 @@ class BackendLifecycle(
                     // instead of beginning a fresh one.
                     pendingWake = null
                     if (ready) {
-                        // Start the monitor inside the same lock that set READY, so a
-                        // concurrent reactive flip cannot leave it running against an
-                        // ASLEEP backend.
+                        // Start the background jobs inside the same lock that set
+                        // READY, so a concurrent reactive flip cannot leave them
+                        // running against an ASLEEP backend.
+                        lastActivityNanos = System.nanoTime()
                         startMonitor()
+                        startIdleShutdown()
                     } else {
-                        monitorJob?.cancel()
-                        monitorJob = null
+                        stopReadyJobs()
                     }
                 }
             }
@@ -192,6 +244,77 @@ class BackendLifecycle(
                     logger.debug("health probe failing ({}/{}): not ready yet", consecutive, downAfterFailures)
                 }
                 delay(interval.milliseconds)
+            }
+        }
+    }
+
+    /**
+     * Starts the idle-shutdown loop: while READY it wakes at least every
+     * [shutdownPollIntervalMs] to re-check the login guard and the idle clock and,
+     * once the backend has been idle for [idleTimeoutMs] (and nobody is logged in,
+     * when a guard is configured), issues the shutdown command and flips READY →
+     * ASLEEP. Only ever called under [mutex], at the READY-write site, like
+     * [startMonitor]; a null [idleTimeoutMs] or [shutdownHandler] keeps the feature
+     * off entirely.
+     *
+     * The clock is event-time: real forwarded requests ([onBackendActivity]) and
+     * observed logins reset [lastActivityNanos], so the machine stays awake for a
+     * full [idleTimeoutMs] after the last request *or* the last logout, whichever
+     * is later — matching "shut down after N minutes of no requests, but never
+     * while someone is logged in". Shutdown is passive: it never fires a wake; the
+     * next request re-wakes via the normal path. The guard and shutdown command
+     * may block briefly (they spawn remote processes); that is fine on this IO
+     * scope and off the request path.
+     */
+    private fun startIdleShutdown() {
+        val timeout = idleTimeoutMs ?: return
+        val handler = shutdownHandler ?: return
+        if (timeout <= 0) return
+        idleShutdownJob = scope.launch {
+            var lastWasLoggedIn = false
+            while (isActive) {
+                var remaining: Long
+                if (!handler.isSafeToShutdown()) {
+                    // Someone is logged in (or the guard could not confirm): keep the
+                    // machine up, open a fresh clock, and remember we are inside a login.
+                    lastActivityNanos = System.nanoTime()
+                    lastWasLoggedIn = true
+                    remaining = timeout
+                } else if (lastWasLoggedIn) {
+                    // First observation of "nobody logged in" since a login: grant a
+                    // full fresh window, so the machine stays awake for at least the
+                    // whole duration after the logged-in user left.
+                    lastActivityNanos = System.nanoTime()
+                    lastWasLoggedIn = false
+                    remaining = timeout
+                } else {
+                    remaining = timeout - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastActivityNanos)
+                }
+
+                if (remaining <= 0) {
+                    if (handler.shutdown()) {
+                        logger.info("idle timeout reached ({}ms); shutdown command issued", timeout)
+                        // Flip under the mutex so a concurrent reactive flip cannot race
+                        // the write; the guard on READY makes it a no-op if one already
+                        // did. stopReadyJobs cancels this loop too (it is its own child),
+                        // and the return below makes the pending cancel moot.
+                        mutex.withLock {
+                            if (status == BackendStatus.READY) {
+                                logger.warn("backend marked ASLEEP: idle shutdown issued")
+                                status = BackendStatus.ASLEEP
+                                stopReadyJobs()
+                            }
+                        }
+                        return@launch
+                    }
+                    logger.warn("shutdown command failed; retrying after a fresh idle window")
+                    lastActivityNanos = System.nanoTime()
+                    lastWasLoggedIn = false
+                    remaining = timeout
+                }
+                // remaining > 0 here (the boundary case was handled above), and the
+                // floor of 1ms keeps a 0/negative poll-interval from busy-spinning.
+                delay(maxOf(1L, minOf(shutdownPollIntervalMs, remaining)).milliseconds)
             }
         }
     }

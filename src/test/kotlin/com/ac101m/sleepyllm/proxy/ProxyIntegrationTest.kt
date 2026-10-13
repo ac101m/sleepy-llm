@@ -5,9 +5,11 @@ import com.ac101m.sleepyllm.config.BackendConfig
 import com.ac101m.sleepyllm.config.BackendMonitorConfig
 import com.ac101m.sleepyllm.config.HealthConfig
 import com.ac101m.sleepyllm.config.ProxyConfig
+import com.ac101m.sleepyllm.config.ShutdownConfig
 import com.ac101m.sleepyllm.config.SleepyLlmConfig
 import com.ac101m.sleepyllm.config.WakeConfig
 import com.ac101m.sleepyllm.config.WakeMode
+import com.ac101m.sleepyllm.shutdown.ShutdownHandler
 import com.ac101m.sleepyllm.wake.WakeSender
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
@@ -45,6 +47,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.atomic.AtomicInteger
 
 class ProxyIntegrationTest {
 
@@ -122,12 +125,31 @@ class ProxyIntegrationTest {
         }
     }
 
+    /** Idle-shutdown actor whose shutdown powers the backend down and counts calls. */
+    private class FakeShutdownHandler(
+        private val onShutdown: () -> Unit,
+    ) : ShutdownHandler {
+        val shutdownCalls = AtomicInteger(0)
+
+        @Volatile
+        var safe = true
+
+        override fun isSafeToShutdown(): Boolean = safe
+
+        override fun shutdown(): Boolean {
+            shutdownCalls.incrementAndGet()
+            onShutdown()
+            return true
+        }
+    }
+
     private fun config(
         backendPort: Int,
         timeoutMs: Long,
         healthPath: String = "/health",
         modelsCacheFile: File? = null,
         monitor: BackendMonitorConfig? = null,
+        shutdown: ShutdownConfig? = null,
     ) = SleepyLlmConfig(
         proxy = ProxyConfig(host = "127.0.0.1", port = 0),
         backend = BackendConfig(
@@ -138,7 +160,8 @@ class ProxyIntegrationTest {
             modelsCacheFile = modelsCacheFile,
             monitor = monitor,
         ),
-        wake = WakeConfig(mode = WakeMode.DUMMY, command = "wakeonlan", mac = "aa:bb:cc:dd:ee:ff"),
+        wake = WakeConfig(mode = WakeMode.DUMMY, command = emptyList()),
+        shutdown = shutdown,
     )
 
     @Test
@@ -505,6 +528,132 @@ class ProxyIntegrationTest {
                 // Had the poller not flipped READY -> ASLEEP while idle, this request
                 // would have forwarded and returned 502 with wake.calls still 1.
                 assertEquals(2, wake.calls, "the idle poller must have marked the backend down")
+            }
+        } finally {
+            backend.stop()
+        }
+    }
+
+    @Test
+    fun `idle shutdown powers the backend down and the next request wakes it again`() = runBlocking {
+        val backend = FakeBackend().apply { healthy = true }.start()
+        val wake = DelayedWakeSender(onWake = { backend.healthy = true })
+        val handler = FakeShutdownHandler(onShutdown = { backend.healthy = false })
+        try {
+            testApplication {
+                application {
+                    module(
+                        config(
+                            backend.port(),
+                            5_000,
+                            shutdown = ShutdownConfig(idleTimeoutMs = 200, pollIntervalMs = 50, command = listOf("poweroff")),
+                        ),
+                        wake,
+                        handler,
+                    )
+                }
+                val client = createClient { }
+
+                assertEquals(HttpStatusCode.OK, client.get("/echo").status)
+                assertEquals(1, wake.calls)
+
+                // No requests: the idle loop powers the machine down on its own.
+                withTimeout(5_000) {
+                    while (handler.shutdownCalls.get() == 0) delay(20)
+                }
+                assertEquals(1, handler.shutdownCalls.get())
+                assertEquals(1, wake.calls, "the idle shutdown itself must never fire a wake")
+
+                // The shutdown flipped READY -> ASLEEP, so the next request wakes it again.
+                val reawoken = client.get("/echo")
+                withTimeout(5_000) {
+                    while (wake.calls < 2) delay(20)
+                }
+                assertEquals(2, wake.calls, "after an idle shutdown the next request must re-wake")
+                assertEquals(HttpStatusCode.OK, reawoken.status)
+            }
+        } finally {
+            backend.stop()
+        }
+    }
+
+    @Test
+    fun `forwarded v1 models polling does not reset the idle timer`() = runBlocking {
+        val backend = FakeBackend().apply { healthy = true }.start()
+        val wake = DelayedWakeSender(onWake = {})
+        val handler = FakeShutdownHandler(onShutdown = { backend.healthy = false })
+        try {
+            testApplication {
+                application {
+                    module(
+                        config(
+                            backend.port(),
+                            5_000,
+                            shutdown = ShutdownConfig(idleTimeoutMs = 200, pollIntervalMs = 50, command = listOf("poweroff")),
+                        ),
+                        wake,
+                        handler,
+                    )
+                }
+                val client = createClient { }
+
+                // Reach READY once: this request resets the timer, but the /v1/models
+                // polling that follows must not count as activity.
+                assertEquals(HttpStatusCode.OK, client.get("/echo").status)
+                assertEquals(1, wake.calls)
+
+                // Poll /v1/models every 40ms — comfortably inside the 200ms idle
+                // window. Had that traffic counted as activity, the shutdown could
+                // never fire; it must fire anyway.
+                withTimeout(5_000) {
+                    while (handler.shutdownCalls.get() == 0) {
+                        val response = client.get("/v1/models")
+                        if (handler.shutdownCalls.get() > 0) break // shutdown fired mid-poll
+                        assertEquals(HttpStatusCode.OK, response.status)
+                        delay(40)
+                    }
+                }
+                assertTrue(handler.shutdownCalls.get() >= 1, "model polling must not keep the machine awake")
+            }
+        } finally {
+            backend.stop()
+        }
+    }
+
+    @Test
+    fun `real forwarded requests reset the idle timer`() = runBlocking {
+        val backend = FakeBackend().apply { healthy = true }.start()
+        val wake = DelayedWakeSender(onWake = {})
+        val handler = FakeShutdownHandler(onShutdown = { backend.healthy = false })
+        try {
+            testApplication {
+                application {
+                    module(
+                        config(
+                            backend.port(),
+                            5_000,
+                            shutdown = ShutdownConfig(idleTimeoutMs = 300, pollIntervalMs = 50, command = listOf("poweroff")),
+                        ),
+                        wake,
+                        handler,
+                    )
+                }
+                val client = createClient { }
+
+                // Nine requests 100ms apart — far longer than the 300ms window, yet
+                // each real request resets it, so the machine must stay up throughout.
+                repeat(9) {
+                    assertEquals(HttpStatusCode.OK, client.get("/echo").status)
+                    delay(100)
+                }
+                assertEquals(0, handler.shutdownCalls.get(), "real traffic must reset the idle timer")
+                assertEquals(1, wake.calls, "real traffic must not cause extra wakes either")
+
+                // Once the traffic stops, the machine powers itself down.
+                withTimeout(5_000) {
+                    while (handler.shutdownCalls.get() == 0) delay(20)
+                }
+                assertEquals(1, handler.shutdownCalls.get())
             }
         } finally {
             backend.stop()

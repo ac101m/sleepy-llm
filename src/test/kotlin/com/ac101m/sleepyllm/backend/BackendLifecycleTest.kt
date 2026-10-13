@@ -1,5 +1,6 @@
 package com.ac101m.sleepyllm.backend
 
+import com.ac101m.sleepyllm.shutdown.ShutdownHandler
 import com.ac101m.sleepyllm.wake.WakeSender
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -24,6 +25,24 @@ class BackendLifecycleTest {
         }
     }
 
+    /** Idle-shutdown actor whose guard and result are toggled by the test. */
+    private class FakeShutdownHandler : ShutdownHandler {
+        @Volatile
+        var safe = true
+
+        @Volatile
+        var result = true
+
+        val shutdownCalls = AtomicInteger(0)
+
+        override fun isSafeToShutdown(): Boolean = safe
+
+        override fun shutdown(): Boolean {
+            shutdownCalls.incrementAndGet()
+            return result
+        }
+    }
+
     private fun lifecycle(
         wake: WakeSender,
         probe: () -> Boolean,
@@ -32,6 +51,9 @@ class BackendLifecycleTest {
         attempts: Int = 3,
         monitorIntervalMs: Long? = null,
         downAfterFailures: Int = 3,
+        idleTimeoutMs: Long? = null,
+        shutdownPollIntervalMs: Long = 10,
+        shutdownHandler: ShutdownHandler? = null,
     ) = BackendLifecycle(
         wakeSender = wake,
         healthChecker = HealthChecker { probe() },
@@ -40,6 +62,9 @@ class BackendLifecycleTest {
         wakeAttempts = attempts,
         monitorIntervalMs = monitorIntervalMs,
         downAfterFailures = downAfterFailures,
+        idleTimeoutMs = idleTimeoutMs,
+        shutdownPollIntervalMs = shutdownPollIntervalMs,
+        shutdownHandler = shutdownHandler,
     )
 
     @Test
@@ -222,6 +247,205 @@ class BackendLifecycleTest {
             // Calling the hook from a non-READY state must not throw or change state.
             lc.onBackendUnreachable()
             assertEquals(BackendStatus.ASLEEP, lc.status, "the hook is a no-op when not READY")
+        }
+    }
+
+    @Test
+    fun `idle shutdown fires after no activity for the duration`() = runBlocking {
+        val wake = CountingWakeSender()
+        val handler = FakeShutdownHandler()
+        val lc = lifecycle(
+            wake,
+            probe = { true },
+            timeoutMs = 2_000,
+            pollMs = 5,
+            idleTimeoutMs = 50,
+            shutdownPollIntervalMs = 10,
+            shutdownHandler = handler,
+        )
+        lc.use {
+            assertTrue(lc.awaitReady())
+            withTimeout(2_000) {
+                while (handler.shutdownCalls.get() == 0) delay(10)
+            }
+            assertEquals(1, handler.shutdownCalls.get())
+            assertEquals(BackendStatus.ASLEEP, lc.status, "issuing a shutdown must flip READY -> ASLEEP")
+            assertEquals(1, wake.calls, "the idle shutdown itself must never fire a wake")
+        }
+    }
+
+    @Test
+    fun `idle shutdown loop is not started when not configured`() = runBlocking {
+        val wake = CountingWakeSender()
+        val handler = FakeShutdownHandler()
+        val lc = lifecycle(
+            wake,
+            probe = { true },
+            timeoutMs = 2_000,
+            pollMs = 5,
+            shutdownHandler = handler, // idleTimeoutMs = null
+        )
+        lc.use {
+            assertTrue(lc.awaitReady())
+            delay(300)
+            assertEquals(0, handler.shutdownCalls.get(), "without an idle window the loop must not run")
+            assertEquals(BackendStatus.READY, lc.status)
+        }
+    }
+
+    @Test
+    fun `idle shutdown loop does not run while not ready`() = runBlocking {
+        val wake = object : WakeSender {
+            override fun wake(): Nothing = throw IllegalStateException("no MAC address configured")
+        }
+        val handler = FakeShutdownHandler()
+        val lc = lifecycle(
+            wake,
+            probe = { false },
+            timeoutMs = 100,
+            pollMs = 5,
+            attempts = 1,
+            idleTimeoutMs = 50,
+            shutdownPollIntervalMs = 10,
+            shutdownHandler = handler,
+        )
+        lc.use {
+            assertFalse(lc.awaitReady())
+            assertEquals(BackendStatus.ASLEEP, lc.status)
+            delay(300)
+            assertEquals(0, handler.shutdownCalls.get(), "idle shutdown must only run against a READY backend")
+        }
+    }
+
+    @Test
+    fun `request activity resets the idle timer`() = runBlocking {
+        val wake = CountingWakeSender()
+        val handler = FakeShutdownHandler()
+        val lc = lifecycle(
+            wake,
+            probe = { true },
+            timeoutMs = 2_000,
+            pollMs = 5,
+            idleTimeoutMs = 100,
+            shutdownPollIntervalMs = 10,
+            shutdownHandler = handler,
+        )
+        lc.use {
+            assertTrue(lc.awaitReady())
+            // Four hundred milliseconds of wall time — four idle windows' worth —
+            // during which each onBackendActivity() resets the clock, so the
+            // machine must never power itself down.
+            repeat(8) {
+                lc.onBackendActivity()
+                delay(50)
+            }
+            assertEquals(0, handler.shutdownCalls.get(), "real traffic must reset the idle timer")
+            assertEquals(BackendStatus.READY, lc.status)
+            // Once the traffic stops the window finally elapses.
+            withTimeout(2_000) {
+                while (handler.shutdownCalls.get() == 0) delay(10)
+            }
+            assertEquals(1, handler.shutdownCalls.get())
+        }
+    }
+
+    @Test
+    fun `logged-in user defers shutdown until they log out`() = runBlocking {
+        val wake = CountingWakeSender()
+        val handler = FakeShutdownHandler()
+        val lc = lifecycle(
+            wake,
+            probe = { true },
+            timeoutMs = 2_000,
+            pollMs = 5,
+            idleTimeoutMs = 150,
+            shutdownPollIntervalMs = 10,
+            shutdownHandler = handler,
+        )
+        lc.use {
+            assertTrue(lc.awaitReady())
+            handler.safe = false // a user logs in
+            delay(500)           // far past the idle window
+            assertEquals(0, handler.shutdownCalls.get(), "a logged-in user must defer shutdown")
+            assertEquals(BackendStatus.READY, lc.status)
+
+            handler.safe = true // they log out
+            // From the first "nobody logged in" observation the machine gets a full
+            // fresh window, so shutdown fires only after the whole duration.
+            withTimeout(2_000) {
+                while (handler.shutdownCalls.get() == 0) delay(10)
+            }
+            assertEquals(1, handler.shutdownCalls.get())
+            assertEquals(BackendStatus.ASLEEP, lc.status)
+        }
+    }
+
+    @Test
+    fun `shutdown failure keeps status ready and retries after a fresh window`() = runBlocking {
+        val wake = CountingWakeSender()
+        val handler = FakeShutdownHandler().apply { result = false }
+        val lc = lifecycle(
+            wake,
+            probe = { true },
+            timeoutMs = 2_000,
+            pollMs = 5,
+            idleTimeoutMs = 50,
+            shutdownPollIntervalMs = 10,
+            shutdownHandler = handler,
+        )
+        lc.use {
+            assertTrue(lc.awaitReady())
+            withTimeout(2_000) {
+                while (handler.shutdownCalls.get() < 3) delay(10)
+            }
+            assertTrue(handler.shutdownCalls.get() >= 3, "a failed shutdown must be retried")
+            assertEquals(BackendStatus.READY, lc.status, "a failed shutdown must not flip state")
+        }
+    }
+
+    @Test
+    fun `idle shutdown loop stops when the backend leaves ready`() = runBlocking {
+        val wake = CountingWakeSender()
+        val handler = FakeShutdownHandler()
+        val lc = lifecycle(
+            wake,
+            probe = { true },
+            timeoutMs = 2_000,
+            pollMs = 5,
+            idleTimeoutMs = 50,
+            shutdownPollIntervalMs = 10,
+            shutdownHandler = handler,
+        )
+        lc.use {
+            assertTrue(lc.awaitReady())
+            lc.onBackendUnreachable() // READY -> ASLEEP reactively
+            assertEquals(BackendStatus.ASLEEP, lc.status)
+            delay(300)
+            assertEquals(0, handler.shutdownCalls.get(), "the idle loop must stop once READY is left")
+        }
+    }
+
+    @Test
+    fun `idle shutdown fires at most once`() = runBlocking {
+        val wake = CountingWakeSender()
+        val handler = FakeShutdownHandler()
+        val lc = lifecycle(
+            wake,
+            probe = { true },
+            timeoutMs = 2_000,
+            pollMs = 5,
+            idleTimeoutMs = 50,
+            shutdownPollIntervalMs = 10,
+            shutdownHandler = handler,
+        )
+        lc.use {
+            assertTrue(lc.awaitReady())
+            withTimeout(2_000) {
+                while (handler.shutdownCalls.get() == 0) delay(10)
+            }
+            assertEquals(1, handler.shutdownCalls.get())
+            delay(200)
+            assertEquals(1, handler.shutdownCalls.get(), "shutdown must be issued exactly once")
         }
     }
 }

@@ -21,8 +21,10 @@ client ──► Sleepy LLM ──► wake on demand (Wake-on-LAN command / dumm
   arriving during a wake share the same in-flight wake — exactly one packet is
   sent, never one per request.
 - **Pluggable wake**: `wake.mode = "dummy"` does nothing (safe for development);
-  `wake.mode = "command"` runs `wakeonlan <mac>`, with an optional `wake.subnet`
-  broadcast forwarded via `-i` for subnets other than the default.
+  `wake.mode = "command"` runs the user-configured `wake.command` verbatim as argv
+  (no shell) — e.g. `["wakeonlan", "-i", "192.168.10.255", "aa:bb:cc:dd:ee:ff"]` —
+  so the MAC address, broadcast and any tool-specific flags are fully under the
+  user's control.
 - **Cached model list**: `GET /v1/models` is answered from a disk cache whenever
   the backend is not ready, so model-list polling never wakes the server. The
   cache refreshes atomically on every successful `/v1/models` the proxy performs —
@@ -42,6 +44,16 @@ client ──► Sleepy LLM ──► wake on demand (Wake-on-LAN command / dumm
   has gone. The poller is deliberately slow (10s) because latency-sensitive
   detection is the reactive path — a request that fails to connect flips state
   immediately; the poller exists to catch a backend powered off while idle.
+- **Idle shutdown** (opt-in): when `shutdown` is enabled, the proxy powers the
+  backend machine down after `shutdown.idle-timeout` (default 30m) of no real
+  traffic, and issues the user-configured `shutdown.command` to do it. The idle
+  clock resets on every real forwarded request — but not on `/v1/models`, so a
+  dashboard polling the model list can't keep the machine awake. An optional
+  `shutdown.check-command` guards against powering the machine down while someone
+  is logged in: if it exits non-zero (or can't be run) the machine is treated as
+  occupied and shutdown is deferred, keeping it awake for a full window after the
+  user logs out. After shutdown, the state returns to wake-on-demand, so the next
+  request wakes it again.
 
 ## Building
 
@@ -77,17 +89,23 @@ sleepyllm {
   }
   wake {
     mode = "command"          # or "dummy"
-    command = "wakeonlan"     # binary resolved on PATH (or absolute path)
-    subnet = "192.168.10.255" # optional; broadcast passed to wakeonlan -i (needed across subnets)
-    mac = "aa:bb:cc:dd:ee:ff" # the machine hosting the backend
+    command = ["wakeonlan", "-i", "192.168.10.255", "aa:bb:cc:dd:ee:ff"]
+                              # ^ full argv, run as-is; MAC, broadcast and tool flags all here
+  }
+  shutdown {                  # optional; disabled by default
+    enabled = true
+    idle-timeout = 30m        # power down after this long with no real requests (and no logged-in users)
+    poll-interval = 1m        # how often to re-check the login guard and idle clock
+    command = ["ssh", "user@host", "sudo", "poweroff"]  # argv; run via ProcessBuilder, no shell
+    check-command = ["ssh", "user@host", "test", "-z", "$(who)"]  # optional; exit 0 = nobody logged in
   }
 }
 ```
 
-With `wake.mode = "command"`, Sleepy LLM verifies at startup that `wake.command`
-can be executed (via `--version` / `--help`) and refuses to start if the tool is
-missing from the PATH or not executable. `wake.mode = "dummy"` performs no such
-check.
+With `wake.mode = "command"`, Sleepy LLM verifies at startup that the program
+named by the first element of `wake.command` can be spawned (via `--version`,
+falling back to `--help`) and refuses to start if it is missing from the PATH or
+not executable. `wake.mode = "dummy"` performs no such check.
 
 ## Roadmap
 

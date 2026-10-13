@@ -89,6 +89,12 @@ class SleepyProxy(
             )
         }
 
+        // Real traffic resets the idle-shutdown clock; /v1/models is excluded so a
+        // dashboard polling the model list can never keep the machine awake. Cached
+        // model serves already returned above and never reach this point.
+        val isModelsPoll = call.request.httpMethod == HttpMethod.Get && call.request.path() == modelsPath
+        if (!isModelsPoll) lifecycle.onBackendActivity()
+
         try {
             forward(call)
         } catch (t: Throwable) {

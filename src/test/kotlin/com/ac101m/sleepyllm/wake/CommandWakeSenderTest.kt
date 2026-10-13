@@ -1,7 +1,5 @@
 package com.ac101m.sleepyllm.wake
 
-import com.ac101m.sleepyllm.config.WakeConfig
-import com.ac101m.sleepyllm.config.WakeMode
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -24,44 +22,17 @@ class CommandWakeSenderTest {
         override fun destroy() {}
     }
 
-    private fun config(subnet: String?) = WakeConfig(
-        mode = WakeMode.COMMAND,
-        command = "wakeonlan",
-        mac = "aa:bb:cc:dd:ee:ff",
-        subnet = subnet,
-    )
+    /** A realistic wake command the user might configure, MAC and subnet folded in. */
+    private fun wakeCommand(tool: String = "wakeonlan") = listOf(tool, "-i", "192.168.10.255", "aa:bb:cc:dd:ee:ff")
 
     @Test
-    fun `command includes -i subnet when one is configured`() {
-        assertEquals(
-            listOf("wakeonlan", "-i", "192.168.10.255", "aa:bb:cc:dd:ee:ff"),
-            CommandWakeSender.buildCommand(config("192.168.10.255")),
-        )
-    }
-
-    @Test
-    fun `command omits -i when no subnet is configured`() {
-        assertEquals(
-            listOf("wakeonlan", "aa:bb:cc:dd:ee:ff"),
-            CommandWakeSender.buildCommand(config(null)),
-        )
-    }
-
-    @Test
-    fun `command omits -i when subnet is blank`() {
-        assertEquals(
-            listOf("wakeonlan", "aa:bb:cc:dd:ee:ff"),
-            CommandWakeSender.buildCommand(config("   ")),
-        )
-    }
-
-    @Test
-    fun `verifyRunnable accepts a tool that spawns cleanly`() {
+    fun `verifyRunnable accepts a command whose tool spawns cleanly`() {
         val spawned = mutableListOf<List<String>>()
-        CommandWakeSender.verifyRunnable("wakeonlan", spawn = { cmd ->
+        CommandWakeSender.verifyRunnable(wakeCommand(), spawn = { cmd ->
             spawned += cmd
             fakeProcess(exitCode = 0)
         })
+        // Only the first element (the tool) is probed, not the whole argv list.
         assertEquals(listOf("wakeonlan", "--version"), spawned[0])
     }
 
@@ -73,14 +44,14 @@ class CommandWakeSenderTest {
             if (cmd.last() == "--version") throw IOException("cannot run") else fakeProcess(exitCode = 1)
         }
         // Exit code is irrelevant to the probe: spawning alone proves presence.
-        CommandWakeSender.verifyRunnable("wakeonlan", spawn = spawn)
+        CommandWakeSender.verifyRunnable(wakeCommand(), spawn = spawn)
         assertEquals(listOf("wakeonlan", "--version", "wakeonlan", "--help"), spawned.flatten())
     }
 
     @Test
     fun `verifyRunnable fails fast when the tool cannot be spawned at all`() {
         val error = assertFailsWith<IllegalStateException> {
-            CommandWakeSender.verifyRunnable("no-such-wake-tool", spawn = { throw IOException("ENOENT") })
+            CommandWakeSender.verifyRunnable(wakeCommand("no-such-wake-tool"), spawn = { throw IOException("ENOENT") })
         }
         assertTrue("no-such-wake-tool" in error.message.orEmpty())
     }
