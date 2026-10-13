@@ -15,3 +15,6 @@ build/
 
 # Runtime state
 /sleepy-llm-models.json
+
+# Claude
+.claude
