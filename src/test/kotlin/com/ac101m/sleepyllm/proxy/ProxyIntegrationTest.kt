@@ -134,6 +134,8 @@ class ProxyIntegrationTest {
         @Volatile
         var safe = true
 
+        override fun hasLoginGuard(): Boolean = true
+
         override fun isSafeToShutdown(): Boolean = safe
 
         override fun shutdown(): Boolean {

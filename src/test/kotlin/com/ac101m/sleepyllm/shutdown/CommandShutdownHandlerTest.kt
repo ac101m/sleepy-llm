@@ -33,6 +33,7 @@ class CommandShutdownHandlerTest {
     fun `isSafeToShutdown is always true without a guard command`() {
         val spawned = java.util.concurrent.atomic.AtomicInteger(0)
         val h = handler(spawn = { spawned.incrementAndGet(); fakeProcess() })
+        assertFalse(h.hasLoginGuard(), "no check-command means no login guard")
         assertTrue(h.isSafeToShutdown())
         assertEquals(0, spawned.get(), "with no check-command the guard must not be spawned at all")
     }
@@ -90,6 +91,7 @@ class CommandShutdownHandlerTest {
             spawned += cmd
             fakeProcess(exitCode = 0)
         })
+        assertTrue(h.hasLoginGuard(), "a configured check-command must be reported as an active guard")
         assertTrue(h.isSafeToShutdown())
         assertTrue(h.shutdown())
         assertEquals(

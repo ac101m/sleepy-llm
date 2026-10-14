@@ -26,6 +26,8 @@ class CommandShutdownHandler(
 ) : ShutdownHandler {
     private val logger = LoggerFactory.getLogger(CommandShutdownHandler::class.java)
 
+    override fun hasLoginGuard(): Boolean = checkCommand != null
+
     override fun isSafeToShutdown(): Boolean {
         val check = checkCommand ?: return true
         return try {

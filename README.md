@@ -2,16 +2,12 @@
 
 A reverse proxy for LLM inference servers that wakes your server on demand and
 shuts it down when idle. When a request arrives, Sleepy LLM wakes the backend
-(via a Wake-on-LAN command), waits for it to become healthy, then forwards the
+(via a user defined command), waits for it to become healthy, then forwards the
 request. While the server is awake, traffic is proxied straight through.
 
-## How it works
+Full disclosure: This project was authored largely by AI.
 
-```
-client ──► Sleepy LLM ──► wake on demand (Wake-on-LAN command / dummy) ──► LLM inference server
-                │
-                └── health-checks backend, forwards request once ready
-```
+## How it works
 
 - **Reverse proxy**: application-level proxy that forwards every method, path
   and query string to the backend. Request and response bodies are streamed, so
@@ -97,7 +93,7 @@ sleepyllm {
     idle-timeout = 30m        # power down after this long with no real requests (and no logged-in users)
     poll-interval = 1m        # how often to re-check the login guard and idle clock
     command = ["ssh", "user@host", "sudo", "poweroff"]  # argv; run via ProcessBuilder, no shell
-    check-command = ["ssh", "user@host", "test", "-z", "$(who)"]  # optional; exit 0 = nobody logged in
+    check-command = ["ssh", "user@host", "is_anyone_home"]  # optional; exit 0 = nobody logged in
   }
 }
 ```

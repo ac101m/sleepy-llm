@@ -35,6 +35,8 @@ class BackendLifecycleTest {
 
         val shutdownCalls = AtomicInteger(0)
 
+        override fun hasLoginGuard(): Boolean = true
+
         override fun isSafeToShutdown(): Boolean = safe
 
         override fun shutdown(): Boolean {

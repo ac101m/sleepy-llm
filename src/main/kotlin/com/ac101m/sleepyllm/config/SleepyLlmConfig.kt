@@ -1,7 +1,10 @@
 package com.ac101m.sleepyllm.config
 
 import com.typesafe.config.Config
+import com.typesafe.config.ConfigException
 import com.typesafe.config.ConfigFactory
+import com.typesafe.config.ConfigRenderOptions
+import org.slf4j.LoggerFactory
 import java.io.File
 
 /**
@@ -111,11 +114,53 @@ data class WakeConfig(
 
 object SleepyLlmConfigLoader {
     private const val CONFIG_ENV_VAR = "SLEEPY_LLM_CONFIG"
+    private val logger = LoggerFactory.getLogger(SleepyLlmConfigLoader::class.java)
+
+    /**
+     * Every recognized key in the `sleepyllm` tree, per object, so a typo'd field
+     * cannot be silently ignored. HOCON accepts unknown keys without complaint, so
+     * `check_config` instead of `check-command` would otherwise fall back to its
+     * classpath default and quietly disable the login guard — the exact failure
+     * [validateKnownKeys] exists to make loud. Paths are relative to `sleepyllm`.
+     */
+    private val knownKeys: Map<String, Set<String>> = mapOf(
+        "" to setOf("proxy", "backend", "wake", "shutdown"),
+        "proxy" to setOf("host", "port"),
+        "backend" to setOf("scheme", "host", "port", "health", "models-cache-file", "monitor"),
+        "backend.health" to setOf("path", "timeout", "poll-interval"),
+        "backend.monitor" to setOf("enabled", "interval", "timeout", "failures"),
+        "wake" to setOf("mode", "command"),
+        "shutdown" to setOf("enabled", "idle-timeout", "poll-interval", "command", "check-command"),
+    )
+
+    /**
+     * Rejects unrecognized keys anywhere in the `sleepyllm` tree, naming the
+     * offending key(s) and the parent so the fix is obvious. [load] calls this on
+     * the merged (user file + classpath) config, so both sources are validated and
+     * a typo is a hard startup error rather than a silent behavior change. Kept
+     * [internal] for tests. Throws [ConfigException.BadValue].
+     */
+    internal fun validateKnownKeys(root: Config) {
+        for ((path, allowed) in knownKeys) {
+            val obj = if (path.isEmpty()) root else runCatching { root.getConfig(path) }.getOrNull() ?: continue
+            val unknown = obj.root().keys - allowed
+            if (unknown.isNotEmpty()) {
+                val where = if (path.isEmpty()) "sleepyllm" else "sleepyllm.$path"
+                throw ConfigException.BadValue(
+                    where,
+                    "unrecognized key(s): ${unknown.joinToString(", ")} (known: ${allowed.joinToString(", ")}). " +
+                        "HOCON would silently ignore these, so they have no effect; this is usually a typo, " +
+                        "e.g. \"check_config\" instead of \"check-command\".",
+                )
+            }
+        }
+    }
 
     fun load(): SleepyLlmConfig {
         val config = loadHocon()
         val root = config.getConfig("sleepyllm")
-        return SleepyLlmConfig(
+        validateKnownKeys(root)
+        val parsed = SleepyLlmConfig(
             proxy = ProxyConfig(
                 host = root.getString("proxy.host"),
                 port = root.getInt("proxy.port"),
@@ -169,6 +214,58 @@ object SleepyLlmConfigLoader {
                 null
             },
         )
+        logEffectiveConfig(root)
+        return parsed
+    }
+
+    /**
+     * Logs the effective, merged configuration once at startup, rendered back by the
+     * HOCON parser itself so it reads like application.conf — nested, indented,
+     * real key names. This mirrors the file's shape an operator can diff mentally
+     * against their override, and shows at once which features are armed and with
+     * which commands. Command lists are shown verbatim (they are run via
+     * ProcessBuilder, no shell, so this mirrors what will actually execute); keep
+     * credentials out of the config, not just out of the logs.
+     */
+    private fun logEffectiveConfig(root: Config) {
+        val rendered = ConfigFactory.empty()
+            .withValue("sleepyllm", root.root())
+            .root()
+            .render(ConfigRenderOptions.defaults().setOriginComments(false).setComments(false).setJson(false))
+        logger.info("effective configuration:\n{}", rendered.compactArrays())
+    }
+
+    /**
+     * The renderer writes each array element on its own line (and the closing `]`
+     * on a line of its own); the only lists in this config are short argv commands,
+     * which read better the way they appear in application.conf (`command = ["ssh",
+     * ...]`, one line). Collapses exactly those blocks — it only fires on a line
+     * ending in `[`, which in this render is always an array opener, never an object.
+     */
+    private fun String.compactArrays(): String {
+        val out = StringBuilder()
+        val lines = lineSequence().iterator()
+        while (lines.hasNext()) {
+            val line = lines.next()
+            if (!line.endsWith('[')) {
+                out.appendLine(line)
+                continue
+            }
+            val elements = mutableListOf<String>()
+            while (lines.hasNext()) {
+                val part = lines.next().trim().removeSuffix(",")
+                when {
+                    part == "]" -> break                       // `]` on its own line
+                    part.endsWith(']') -> {                     // last element shares the line
+                        elements += part.dropLast(1).trim()
+                        break
+                    }
+                    else -> elements += part
+                }
+            }
+            out.appendLine("${line.dropLast(1)}[${elements.joinToString(", ")}]")
+        }
+        return out.toString()
     }
 
     private fun loadHocon(): Config {
@@ -178,7 +275,10 @@ object SleepyLlmConfigLoader {
             ?.let { path ->
                 val file = File(path)
                 require(file.isFile) { "$CONFIG_ENV_VAR points to a non-existent file: $path" }
-                ConfigFactory.parseFile(file).withFallback(classpath)
+                // Resolve the user file against the classpath tree so `${...}` references
+                // in an override render (and are read by the getters in [load]) as their
+                // actual values rather than unresolved tokens.
+                ConfigFactory.parseFile(file).withFallback(classpath).resolve()
             }
             ?: classpath
     }

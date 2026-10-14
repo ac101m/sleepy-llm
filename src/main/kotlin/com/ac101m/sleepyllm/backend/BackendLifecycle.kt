@@ -270,6 +270,17 @@ class BackendLifecycle(
         val timeout = idleTimeoutMs ?: return
         val handler = shutdownHandler ?: return
         if (timeout <= 0) return
+        // Arm-time visibility: without a login guard the proxy powers the machine
+        // down on idle alone, so an absent/misconfigured check-command must be
+        // unmistakable in the logs rather than silently assuming full control.
+        if (handler.hasLoginGuard()) {
+            logger.info("idle shutdown armed: {}ms idle, login guard active", timeout)
+        } else {
+            logger.warn(
+                "idle shutdown armed: {}ms idle with NO login guard — the machine will be powered down on idle alone",
+                timeout,
+            )
+        }
         idleShutdownJob = scope.launch {
             var lastWasLoggedIn = false
             while (isActive) {
@@ -277,6 +288,9 @@ class BackendLifecycle(
                 if (!handler.isSafeToShutdown()) {
                     // Someone is logged in (or the guard could not confirm): keep the
                     // machine up, open a fresh clock, and remember we are inside a login.
+                    if (!lastWasLoggedIn) {
+                        logger.info("login detected: idle shutdown deferred until nobody is logged in")
+                    }
                     lastActivityNanos = System.nanoTime()
                     lastWasLoggedIn = true
                     remaining = timeout
@@ -284,6 +298,7 @@ class BackendLifecycle(
                     // First observation of "nobody logged in" since a login: grant a
                     // full fresh window, so the machine stays awake for at least the
                     // whole duration after the logged-in user left.
+                    logger.info("last user logged out: granting a fresh {}ms idle window before shutdown", timeout)
                     lastActivityNanos = System.nanoTime()
                     lastWasLoggedIn = false
                     remaining = timeout

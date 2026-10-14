@@ -32,6 +32,7 @@ import io.ktor.utils.io.ByteReadChannel
 import org.slf4j.LoggerFactory
 import java.net.SocketException
 import java.net.UnknownHostException
+import java.util.concurrent.TimeUnit
 
 /**
  * Application-level reverse proxy: forwards every request to the configured
@@ -95,8 +96,16 @@ class SleepyProxy(
         val isModelsPoll = call.request.httpMethod == HttpMethod.Get && call.request.path() == modelsPath
         if (!isModelsPoll) lifecycle.onBackendActivity()
 
+        val started = System.nanoTime()
         try {
-            forward(call)
+            val status = forward(call)
+            logger.info(
+                "forwarded {} {} -> {} ({}ms)",
+                call.request.httpMethod,
+                call.request.uri,
+                status.value,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+            )
         } catch (t: Throwable) {
             if (isConnectionFailure(t)) {
                 // The backend was believed READY but a forward could not reach it —
@@ -165,7 +174,14 @@ class SleepyProxy(
         if (call.request.httpMethod != HttpMethod.Get || call.request.path() != modelsPath) return false
         if (lifecycle.status == BackendStatus.READY) return false
         val cached = cache.read() ?: return false
-        logger.debug("serving cached {} ({} bytes, status={})", modelsPath, cached.size, lifecycle.status)
+        val started = System.nanoTime()
+        logger.info(
+            "served {} {} from cache ({} bytes, {}ms)",
+            call.request.httpMethod,
+            call.request.uri,
+            cached.size,
+            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+        )
         call.respond(object : OutgoingContent.ReadChannelContent() {
             override val contentType: ContentType? = ContentType.Application.Json
             override fun readFrom(): ByteReadChannel = ByteReadChannel(cached)
@@ -173,7 +189,11 @@ class SleepyProxy(
         return true
     }
 
-    private suspend fun forward(call: ApplicationCall) {
+    /**
+     * Forwards the incoming request to the backend and streams the response back
+     * to the client. Returns the upstream status code, for the access-log line.
+     */
+    private suspend fun forward(call: ApplicationCall): HttpStatusCode {
         val incoming = call.request
         // Only the (small) models endpoint is buffered for caching; everything
         // else keeps the raw streaming path below.
@@ -182,11 +202,16 @@ class SleepyProxy(
             incoming.path() == modelsPath
         val requestBody = call.receiveChannel()
 
-        // Streaming block form of execute() — Ktor's plain execute() downloads
-        // the whole response into memory before returning (it runs the default
-        // SaveBody plugin), which would hang forever on a live SSE stream that
-        // stays open while tokens are produced. The block form skips body saving,
-        // so the response channel stays live and is forwarded as it arrives.
+        // Streaming block form of execute() — Ktor's plain execute() downloads the
+        // whole response into memory before returning (it runs the default SaveBody
+        // plugin), which would hang forever on a live SSE stream that stays open
+        // while tokens are produced. The block form skips body saving, so the
+        // response channel stays live and is forwarded as it arrives.
+        //
+        // execute's block is not generic (returns Unit), so the upstream status is
+        // captured here for the caller's access-log line. The block always runs
+        // exactly once unless it throws, in which case this never returns anyway.
+        var upstreamStatus = HttpStatusCode.OK
         client.prepareRequest {
             method = incoming.httpMethod
             url {
@@ -221,7 +246,9 @@ class SleepyProxy(
                 override val headers: Headers = response.headers.copyExcluding(excludedResponseHeaders)
                 override fun readFrom(): ByteReadChannel = responseBody
             })
+            upstreamStatus = response.status
         }
+        return upstreamStatus
     }
 
     /**

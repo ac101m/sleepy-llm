@@ -12,6 +12,15 @@ package com.ac101m.sleepyllm.shutdown
 interface ShutdownHandler {
 
     /**
+     * Whether this handler actually consults a login guard before powering the
+     * machine down. False when no check-command is configured, i.e. the proxy
+     * assumes full control of the lifecycle and shuts down on idle alone. Used
+     * for observability: a missing/never-wired guard is a silent shutdown risk,
+     * so arm-time logging flags it.
+     */
+    fun hasLoginGuard(): Boolean
+
+    /**
      * Whether the machine is safe to power down right now. Exit 0 from the
      * configured check-command means nobody is logged in (safe); a non-zero exit,
      * a timeout, or an un-runnable guard means someone is logged in or the machine
