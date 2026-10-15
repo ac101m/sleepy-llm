@@ -79,7 +79,7 @@ fun Application.module(
         shutdownPollIntervalMs = shutdown?.pollIntervalMs ?: 60_000L,
         shutdownHandler = shutdownHandler ?: shutdown?.let(CommandShutdownHandler::from),
     )
-    val proxy = SleepyProxy(client, config.backend, lifecycle, modelsCache)
+    val proxy = SleepyProxy(client, config.backend, lifecycle, modelsCache, config.proxy.logRequests)
 
     intercept(ApplicationCallPipeline.ApplicationPhase.Call) {
         proxy.handle(this.context)

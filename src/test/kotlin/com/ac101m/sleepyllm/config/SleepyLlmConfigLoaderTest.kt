@@ -21,6 +21,9 @@ class SleepyLlmConfigLoaderTest {
         val override = ConfigFactory.parseString(
             """
             sleepyllm {
+              proxy {
+                log-requests = true
+              }
               wake {
                 mode = "command"
                 command = ["wakeonlan", "-i", "192.168.10.255", "aa:bb:cc:dd:ee:ff"]

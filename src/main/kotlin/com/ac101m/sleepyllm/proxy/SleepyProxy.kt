@@ -47,6 +47,8 @@ class SleepyProxy(
     private val lifecycle: ReadyWaiter,
     /** Optional disk cache of the `/v1/models` response; null disables the feature. */
     private val modelsCache: ModelsCache? = null,
+    /** When false (the default), per-request access logging is silent. */
+    private val logRequests: Boolean = false,
 ) {
     private val logger = LoggerFactory.getLogger(SleepyProxy::class.java)
     private val modelsPath: String = BackendConfig.MODELS_PATH
@@ -99,13 +101,15 @@ class SleepyProxy(
         val started = System.nanoTime()
         try {
             val status = forward(call)
-            logger.info(
-                "forwarded {} {} -> {} ({}ms)",
-                call.request.httpMethod,
-                call.request.uri,
-                status.value,
-                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
-            )
+            if (logRequests) {
+                logger.info(
+                    "forwarded {} {} -> {} ({}ms)",
+                    call.request.httpMethod,
+                    call.request.uri,
+                    status.value,
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+                )
+            }
         } catch (t: Throwable) {
             if (isConnectionFailure(t)) {
                 // The backend was believed READY but a forward could not reach it —
@@ -174,14 +178,16 @@ class SleepyProxy(
         if (call.request.httpMethod != HttpMethod.Get || call.request.path() != modelsPath) return false
         if (lifecycle.status == BackendStatus.READY) return false
         val cached = cache.read() ?: return false
-        val started = System.nanoTime()
-        logger.info(
-            "served {} {} from cache ({} bytes, {}ms)",
-            call.request.httpMethod,
-            call.request.uri,
-            cached.size,
-            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
-        )
+        if (logRequests) {
+            val started = System.nanoTime()
+            logger.info(
+                "served {} {} from cache ({} bytes, {}ms)",
+                call.request.httpMethod,
+                call.request.uri,
+                cached.size,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+            )
+        }
         call.respond(object : OutgoingContent.ReadChannelContent() {
             override val contentType: ContentType? = ContentType.Application.Json
             override fun readFrom(): ByteReadChannel = ByteReadChannel(cached)
@@ -263,7 +269,7 @@ class SleepyProxy(
         if (response.status.value in 200..399) {
             modelsCache?.write(bytes)
             logger.debug("cached forwarded {} ({} bytes)", modelsPath, bytes.size)
-        } else {
+        } else if (logRequests) {
             logger.info("GET {} -> {} (not cached)", modelsPath, response.status.value)
         }
         return ByteReadChannel(bytes)

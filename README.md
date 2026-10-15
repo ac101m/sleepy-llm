@@ -77,7 +77,7 @@ the real MAC address):
 
 ```hocon
 sleepyllm {
-  proxy  { host = "0.0.0.0", port = 8080 }
+  proxy  { host = "0.0.0.0", port = 8080, log-requests = true }   # optional; per-request access logging, off by default
   backend {
     host = "127.0.0.1", port = 8000
     health { path = "/v1/models", timeout = 60s, poll-interval = 1s }

@@ -28,6 +28,13 @@ data class SleepyLlmConfig(
 data class ProxyConfig(
     val host: String,
     val port: Int,
+    /**
+     * Log a line per request — forwarded ("forwarded GET /v1/chat/completions ->
+     * 200 (42ms)"), served from the models cache, or a live models fetch that was
+     * not cached. Useful when troubleshooting a real client, but noisy under
+     * steady polling load, so it is off unless explicitly enabled.
+     */
+    val logRequests: Boolean = false,
 )
 
 data class BackendConfig(
@@ -125,7 +132,7 @@ object SleepyLlmConfigLoader {
      */
     private val knownKeys: Map<String, Set<String>> = mapOf(
         "" to setOf("proxy", "backend", "wake", "shutdown"),
-        "proxy" to setOf("host", "port"),
+        "proxy" to setOf("host", "port", "log-requests"),
         "backend" to setOf("scheme", "host", "port", "health", "models-cache-file", "monitor"),
         "backend.health" to setOf("path", "timeout", "poll-interval"),
         "backend.monitor" to setOf("enabled", "interval", "timeout", "failures"),
@@ -164,6 +171,7 @@ object SleepyLlmConfigLoader {
             proxy = ProxyConfig(
                 host = root.getString("proxy.host"),
                 port = root.getInt("proxy.port"),
+                logRequests = root.getBoolean("proxy.log-requests"),
             ),
             backend = BackendConfig(
                 scheme = root.getString("backend.scheme"),
