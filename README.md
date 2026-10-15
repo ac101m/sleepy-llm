@@ -5,7 +5,8 @@ shuts it down when idle. When a request arrives, Sleepy LLM wakes the backend
 (via a user defined command), waits for it to become healthy, then forwards the
 request. While the server is awake, traffic is proxied straight through.
 
-Full disclosure: This project was authored largely by AI.
+Full disclosure: This project was almost entirely vibe-coded using a local instance of
+`Deepseek-V4-Flash-0731`.
 
 ## How it works
 
@@ -16,11 +17,12 @@ Full disclosure: This project was authored largely by AI.
   polls the backend's health endpoint until it is ready (or times out). Requests
   arriving during a wake share the same in-flight wake — exactly one packet is
   sent, never one per request.
-- **Pluggable wake**: `wake.mode = "dummy"` does nothing (safe for development);
-  `wake.mode = "command"` runs the user-configured `wake.command` verbatim as argv
-  (no shell) — e.g. `["wakeonlan", "-i", "192.168.10.255", "aa:bb:cc:dd:ee:ff"]` —
-  so the MAC address, broadcast and any tool-specific flags are fully under the
-  user's control.
+- **Pluggable wake**: the proxy runs `wake.command` verbatim as argv (no shell) —
+  e.g. `["wakeonlan", "-i", "192.168.10.255", "aa:bb:cc:dd:ee:ff"]` — so the MAC
+  address, broadcast and any tool-specific flags are fully under the user's
+  control. The default `["true"]` is a no-op placeholder that does nothing; point
+  the command at your real wake tool (or keep a no-op command if you want a fake
+  wake on purpose).
 - **Cached model list**: `GET /v1/models` is answered from a disk cache whenever
   the backend is not ready, so model-list polling never wakes the server. The
   cache refreshes atomically on every successful `/v1/models` the proxy performs —
@@ -77,10 +79,18 @@ the real MAC address):
 
 ```hocon
 sleepyllm {
-  proxy  { host = "0.0.0.0", port = 8080, log-requests = true }   # optional; per-request access logging, off by default
+  proxy  {
+    host = "0.0.0.0", 
+    port = 8080, 
+    log-requests = true          # optional; per-request access logging, off by default 
+  }
   backend {
     host = "127.0.0.1", port = 8000
-    health { path = "/v1/models", timeout = 60s, poll-interval = 1s }
+    health { 
+      path = "/v1/models", 
+      timeout = 360s, 
+      poll-interval = 1s 
+    }
     models-cache-file = "./sleepy-llm-models.json" # optional; "" disables the /v1/models cache
     monitor {                    # down detection while READY (see "How it works")
       enabled = true
@@ -90,9 +100,8 @@ sleepyllm {
     }
   }
   wake {
-    mode = "command"          # or "dummy"
     command = ["wakeonlan", "-i", "192.168.10.255", "aa:bb:cc:dd:ee:ff"]
-                              # ^ full argv, run as-is; MAC, broadcast and tool flags all here
+             # ^ full argv, run as-is; MAC, broadcast and tool flags all here
   }
   shutdown {                  # optional; disabled by default
     enabled = true
@@ -104,10 +113,10 @@ sleepyllm {
 }
 ```
 
-With `wake.mode = "command"`, Sleepy LLM verifies at startup that the program
-named by the first element of `wake.command` can be spawned (via `--version`,
-falling back to `--help`) and refuses to start if it is missing from the PATH or
-not executable. `wake.mode = "dummy"` performs no such check.
+Sleepy LLM verifies at startup that the program named by the first element of
+`wake.command` can be spawned (via `--version`, falling back to `--help`) and
+refuses to start if it is missing from the PATH or not executable. The default
+`["true"]` passes trivially, which is what makes the no-op placeholder safe.
 
 ## Roadmap
 

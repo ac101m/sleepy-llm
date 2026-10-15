@@ -7,8 +7,8 @@ import com.ac101m.sleepyllm.config.BackendConfig
 import com.ac101m.sleepyllm.config.SleepyLlmConfig
 import com.ac101m.sleepyllm.shutdown.CommandShutdownHandler
 import com.ac101m.sleepyllm.shutdown.ShutdownHandler
+import com.ac101m.sleepyllm.wake.CommandWakeSender
 import com.ac101m.sleepyllm.wake.WakeSender
-import com.ac101m.sleepyllm.wake.WakeSenderFactory
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.HttpTimeout
@@ -24,7 +24,7 @@ import io.ktor.server.application.ApplicationStopped
  * including `/`, is forwarded to the backend.
  *
  * @param wakeSender an optional override, used by tests to substitute the real
- *   (or dummy) wake implementation with a controllable fake.
+ *   wake implementation with a controllable fake.
  * @param shutdownHandler an optional override of the idle-shutdown actor, used by
  *   tests to substitute a controllable fake; when null and `config.shutdown` is
  *   set, the real command-based handler is built from the config.
@@ -53,7 +53,7 @@ fun Application.module(
     val monitor = config.backend.monitor
     val shutdown = config.shutdown
     val lifecycle = BackendLifecycle(
-        wakeSender = wakeSender ?: WakeSenderFactory.create(config.wake),
+        wakeSender = wakeSender ?: CommandWakeSender.from(config.wake),
         healthChecker = HealthChecker.http(
             client,
             config.backend,

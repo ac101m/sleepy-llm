@@ -102,19 +102,14 @@ data class ShutdownConfig(
     val checkCommand: List<String>? = null,
 )
 
-enum class WakeMode {
-    DUMMY,
-    COMMAND,
-}
-
 data class WakeConfig(
-    val mode: WakeMode,
     /**
      * The wake command, as argv, run verbatim via ProcessBuilder with no shell —
      * exactly like the shutdown command. The MAC address, broadcast/interface
      * flags and any tool-specific options are all part of this list, e.g.
      * `["wakeonlan", "-i", "192.168.10.255", "aa:bb:cc:dd:ee:ff"]`; the proxy does
-     * not assemble them. Only used when [mode] is COMMAND.
+     * not assemble them. There is no mode switch — if you want wake to be a no-op
+     * placeholder, point this at a command that does nothing (e.g. `["true"]`).
      */
     val command: List<String>,
 )
@@ -136,7 +131,7 @@ object SleepyLlmConfigLoader {
         "backend" to setOf("scheme", "host", "port", "health", "models-cache-file", "monitor"),
         "backend.health" to setOf("path", "timeout", "poll-interval"),
         "backend.monitor" to setOf("enabled", "interval", "timeout", "failures"),
-        "wake" to setOf("mode", "command"),
+        "wake" to setOf("command"),
         "shutdown" to setOf("enabled", "idle-timeout", "poll-interval", "command", "check-command"),
     )
 
@@ -200,12 +195,13 @@ object SleepyLlmConfigLoader {
                 },
             ),
             wake = run {
-                val mode = WakeMode.valueOf(root.getString("wake.mode").uppercase())
                 val command = root.getStringList("wake.command")
-                require(mode != WakeMode.COMMAND || command.isNotEmpty()) {
-                    "wake.mode = \"command\" requires wake.command (a list of argv) to be set; or set wake.mode = \"dummy\""
+                require(command.isNotEmpty()) {
+                    "wake.command (a list of argv) must be set, e.g. " +
+                        "[\"wakeonlan\", \"-i\", \"192.168.10.255\", \"aa:bb:cc:dd:ee:ff\"]; " +
+                        "to make wake a no-op placeholder set it to [\"true\"]"
                 }
-                WakeConfig(mode, command)
+                WakeConfig(command)
             },
             shutdown = if (root.hasPath("shutdown") && root.getBoolean("shutdown.enabled")) {
                 val command = root.getStringList("shutdown.command")

@@ -8,7 +8,6 @@ import com.ac101m.sleepyllm.config.ProxyConfig
 import com.ac101m.sleepyllm.config.ShutdownConfig
 import com.ac101m.sleepyllm.config.SleepyLlmConfig
 import com.ac101m.sleepyllm.config.WakeConfig
-import com.ac101m.sleepyllm.config.WakeMode
 import com.ac101m.sleepyllm.shutdown.ShutdownHandler
 import com.ac101m.sleepyllm.wake.WakeSender
 import io.ktor.client.HttpClient
@@ -162,7 +161,7 @@ class ProxyIntegrationTest {
             modelsCacheFile = modelsCacheFile,
             monitor = monitor,
         ),
-        wake = WakeConfig(mode = WakeMode.DUMMY, command = emptyList()),
+        wake = WakeConfig(command = emptyList()),
         shutdown = shutdown,
     )
 

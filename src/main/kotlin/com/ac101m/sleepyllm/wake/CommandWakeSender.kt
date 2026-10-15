@@ -78,7 +78,7 @@ class CommandWakeSender(
             if (!probe("--version") && !probe("--help")) {
                 throw IllegalStateException(
                     "wake command '$tool' could not be run: it is not on the PATH or is not executable." +
-                        " Install the wake tool on this host, or set wake.mode = \"dummy\""
+                        " Install the wake tool on this host, or point wake.command at one that is"
                 )
             }
         }
