@@ -82,6 +82,12 @@ interface ReadyWaiter {
  * (via the handler's guard) and, once the backend has been quiet for the window,
  * powers it down ([startIdleShutdown]) — again flipping to ASLEEP so the next
  * request wakes it on demand.
+ *
+ * ASLEEP is not only left via a request, either: a backend the proxy never woke —
+ * started by hand, or rebooted since the last idle shutdown — is picked up by an
+ * up-detection poller ([startUpMonitor]) that watches while ASLEEP and flips
+ * ASLEEP -> READY on a healthy probe, so idle shutdown arms for it as well and the
+ * manually started machine is eventually powered back down.
  */
 class BackendLifecycle(
     private val wakeSender: WakeSender,
@@ -128,6 +134,13 @@ class BackendLifecycle(
 
     /** Running idle-shutdown loop, if any. Only modified under [mutex]. */
     private var idleShutdownJob: Job? = null
+
+    init {
+        // Watch for a backend that is already up while we believe it ASLEEP, so a
+        // manual/external start is caught (and can be idled back down) without
+        // waiting for a request to trip the wake path.
+        startUpMonitor()
+    }
 
     override fun onBackendActivity() {
         lastActivityNanos = System.nanoTime()
@@ -242,6 +255,52 @@ class BackendLifecycle(
                         return@launch
                     }
                     logger.debug("health probe failing ({}/{}): not ready yet", consecutive, downAfterFailures)
+                }
+                delay(interval.milliseconds)
+            }
+        }
+    }
+
+    /**
+     * Starts up-detection: a poller that runs for the lifecycle while the backend
+     * is believed ASLEEP and, on a single healthy probe, flips ASLEEP -> READY and
+     * arms the READY-state jobs (down-detection monitor + idle-shutdown loop) —
+     * the same transition a successful wake would have produced. This is what
+     * lets the proxy shut down a backend it never woke itself: the operator
+     * starts the machine by hand (or it is rebooted after the previous idle
+     * shutdown), the poller notices, and the idle clock starts counting.
+     *
+     * Deliberately passive, like the rest of detection — it never fires a wake,
+     * and an already-up backend is used as-is rather than woken. It is also
+     * deliberately gated: it only arms when idle shutdown is configured *and* a
+     * monitor interval exists (the monitor's cadence is reused as the up-detection
+     * cadence); with no interval (a disabled monitor) today's behavior is kept,
+     * where an ASLEEP backend is noticed only by a request.
+     *
+     * Runs until [close], and [stopReadyJobs] deliberately leaves it running —
+     * its whole job is to watch while ASLEEP, exactly when the READY-state jobs
+     * are stopped.
+     */
+    private fun startUpMonitor() {
+        val interval = monitorIntervalMs ?: return
+        if (idleTimeoutMs == null || shutdownHandler == null) return
+        val probe = monitorProbe ?: healthChecker::isHealthy
+        scope.launch {
+            while (isActive) {
+                if (status == BackendStatus.ASLEEP && probe()) {
+                    mutex.withLock {
+                        // Re-check under the lock: a request may have begun a wake
+                        // (WAKING) in between — that path owns the transition then.
+                        if (status == BackendStatus.ASLEEP) {
+                            logger.info(
+                                "backend detected up while ASLEEP (manually or externally started); treating it as READY",
+                            )
+                            status = BackendStatus.READY
+                            lastActivityNanos = System.nanoTime()
+                            startMonitor()
+                            startIdleShutdown()
+                        }
+                    }
                 }
                 delay(interval.milliseconds)
             }

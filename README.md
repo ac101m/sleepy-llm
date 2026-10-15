@@ -49,7 +49,13 @@ Full disclosure: This project was authored largely by AI.
   is logged in: if it exits non-zero (or can't be run) the machine is treated as
   occupied and shutdown is deferred, keeping it awake for a full window after the
   user logs out. After shutdown, the state returns to wake-on-demand, so the next
-  request wakes it again.
+  request wakes it again. The idle policy applies to a backend the proxy never
+  woke as well: the health poller also runs while the backend is believed ASLEEP,
+  and when it finds the machine already responding — started by hand, or rebooted
+  since the last shutdown — it is treated as READY and the idle clock starts, so a
+  manually started backend is also powered back down after `shutdown.idle-timeout`
+  with no request ever arriving. This up-detection reuses the `backend.monitor`
+  cadence, so disabling the monitor disables it too.
 
 ## Building
 

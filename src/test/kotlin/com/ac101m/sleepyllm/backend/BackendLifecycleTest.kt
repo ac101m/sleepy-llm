@@ -156,6 +156,40 @@ class BackendLifecycleTest {
     }
 
     @Test
+    fun `poller revives a manually started backend and idles it down without a request`() = runBlocking {
+        val wake = CountingWakeSender()
+        val handler = FakeShutdownHandler()
+        // The operator starts the backend by hand, with no request ever arriving:
+        // the proxy believes ASLEEP, but the probe is already healthy.
+        val lc = lifecycle(
+            wake,
+            probe = { true },
+            timeoutMs = 2_000,
+            pollMs = 5,
+            monitorIntervalMs = 5,
+            idleTimeoutMs = 50,
+            shutdownPollIntervalMs = 10,
+            shutdownHandler = handler,
+        )
+        lc.use {
+            // No awaitReady() is ever called: the up-detection poller alone must
+            // discover the backend and arm the idle clock.
+            withTimeout(2_000) {
+                while (lc.status != BackendStatus.READY) delay(10)
+            }
+            assertEquals(BackendStatus.READY, lc.status)
+            assertEquals(0, wake.calls, "up-detection must not fire a wake")
+
+            withTimeout(2_000) {
+                while (handler.shutdownCalls.get() == 0) delay(10)
+            }
+            assertEquals(1, handler.shutdownCalls.get())
+            assertEquals(BackendStatus.ASLEEP, lc.status)
+            assertEquals(0, wake.calls, "an idle shutdown of a detected backend must not fire a wake either")
+        }
+    }
+
+    @Test
     fun `a transient single probe failure does not flip a ready backend`() = runBlocking {
         val wake = CountingWakeSender()
         // Succeed during the initial wake, then fail exactly twice (below the
