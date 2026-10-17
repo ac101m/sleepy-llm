@@ -8,6 +8,7 @@ import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -32,6 +33,7 @@ class ProcessRunnerTest {
         override fun waitFor(): Int = exitCode
         override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = !timedOut
         override fun exitValue(): Int = exitCode
+        override fun isAlive(): Boolean = timedOut
         override fun destroy() {
             onDestroy()
         }
@@ -61,6 +63,20 @@ class ProcessRunnerTest {
         })
         assertTrue(result.timedOut)
         assertTrue(destroyed.get(), "a timed-out process must be force-destroyed")
+    }
+
+    @Test
+    fun `a hung child with its output pipe still open is killed on the deadline, keeping its partial output`() {
+        // The failure mode runCommand exists to bound: a child that stays alive with
+        // stdout open (e.g. ssh to an unreachable host). The read must not block past
+        // the deadline — it must time out, be killed, and keep what it captured.
+        val destroyed = AtomicBoolean(false)
+        val result = runCommand(listOf("ssh", "unreachable"), 300, spawn = {
+            fakeProcess(output = "Connection failed\n", timedOut = true, onDestroy = { destroyed.set(true) })
+        })
+        assertTrue(result.timedOut)
+        assertTrue(destroyed.get(), "a hung child must be force-destroyed on the deadline")
+        assertContains(result.output, "Connection failed")
     }
 
     @Test

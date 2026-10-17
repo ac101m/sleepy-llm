@@ -184,6 +184,11 @@ class BackendLifecycleTest {
                 while (handler.shutdownCalls.get() == 0) delay(10)
             }
             assertEquals(1, handler.shutdownCalls.get())
+            // The flip happens a beat after shutdown() returns, so wait for it rather
+            // than asserting immediately (shutdownCalls increments inside the handler).
+            withTimeout(2_000) {
+                while (lc.status != BackendStatus.ASLEEP) delay(10)
+            }
             assertEquals(BackendStatus.ASLEEP, lc.status)
             assertEquals(0, wake.calls, "an idle shutdown of a detected backend must not fire a wake either")
         }

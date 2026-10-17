@@ -21,6 +21,7 @@ class CommandShutdownHandlerTest {
         override fun waitFor(): Int = exitCode
         override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = !timedOut
         override fun exitValue(): Int = exitCode
+        override fun isAlive(): Boolean = timedOut
         override fun destroy() {}
     }
 
