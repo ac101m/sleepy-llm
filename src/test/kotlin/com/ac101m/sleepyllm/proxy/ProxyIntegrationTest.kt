@@ -10,6 +10,9 @@ import com.ac101m.sleepyllm.config.SleepyLlmConfig
 import com.ac101m.sleepyllm.config.WakeConfig
 import com.ac101m.sleepyllm.shutdown.ShutdownHandler
 import com.ac101m.sleepyllm.wake.WakeSender
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.request.get
@@ -44,7 +47,9 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import org.slf4j.LoggerFactory
 import java.io.File
+import java.net.Socket
 import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -84,6 +89,18 @@ class ProxyIntegrationTest {
                         delay(100)
                         writeFully("part2".toByteArray(), 0, "part2".length)
                         flush()
+                    }
+                }
+                // A stream that keeps producing after the first events, so a client
+                // that hangs up mid-way leaves the proxy with writes into a dead
+                // socket long after it has gone — the production failure shape.
+                get("/stream-multi") {
+                    call.respondBytesWriter(contentType = ContentType.Text.Plain) {
+                        repeat(20) {
+                            writeFully("event-$it".toByteArray(), 0, "event-$it".length)
+                            flush()
+                            delay(30)
+                        }
                     }
                 }
                 // OpenAI-style server-sent events: writes one event, then blocks on
@@ -308,6 +325,94 @@ class ProxyIntegrationTest {
                 client.close()
             }
         } finally {
+            proxy.stop(100, 500)
+            backend.stop()
+        }
+    }
+
+    @Test
+    fun `a connection lost mid-stream is logged as abandoned, not a proxy error`() = runBlocking {
+        val backend = FakeBackend().apply { healthy = true }.start()
+        val wake = DelayedWakeSender(onWake = {})
+        // A real Netty proxy over sockets: the in-process test engine buffers
+        // response bodies asynchronously, so it cannot exercise the closed-channel
+        // write that a lost client connection produces on a live streaming response.
+        val proxy = embeddedServer(Netty, host = "127.0.0.1", port = 0) {
+            module(config(backend.port(), 5_000), wake)
+        }
+
+        // Capture the proxy's own log lines: the contract is that a connection
+        // lost mid-stream surfaces as a WARN (naming the request, and how long it
+        // had been streaming), never as a "proxy error" ERROR.
+        val proxyLogger = LoggerFactory.getLogger(SleepyProxy::class.java) as ch.qos.logback.classic.Logger
+        val captured = ListAppender<ILoggingEvent>()
+        captured.setContext(proxyLogger.loggerContext)
+        captured.start()
+        proxyLogger.addAppender(captured)
+        try {
+            proxy.start(wait = false)
+            val proxyPort = proxy.engine.resolvedConnectors().first().port
+
+            // Reach READY exactly once so the backend status is known-good before
+            // the abort and wake.calls gives a stable baseline.
+            val client = HttpClient(CIO)
+            try {
+                assertEquals(HttpStatusCode.OK, client.get("http://127.0.0.1:$proxyPort/echo").status)
+                assertEquals(1, wake.calls)
+            } finally {
+                client.close()
+            }
+
+            // Open a raw socket, request the streaming endpoint, read a couple of
+            // events, then walk away while the backend is still producing — the
+            // production pattern behind every closed-channel error in the field
+            // log. SO_LINGER 0 forces an RST, so the proxy's subsequent writes
+            // into the connection fail immediately rather than vanishing into a
+            // half-closed socket.
+            Socket().apply {
+                setSoLinger(true, 0)
+                connect(java.net.InetSocketAddress("127.0.0.1", proxyPort), 2_000)
+                getOutputStream().write("GET /stream-multi HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray())
+                getOutputStream().flush()
+            }.use { socket ->
+                val input = socket.getInputStream()
+                val sb = StringBuilder()
+                val buf = ByteArray(1024)
+                withTimeout(5_000) {
+                    while (!sb.contains("event-1")) {
+                        val n = input.read(buf)
+                        if (n < 0) throw IllegalStateException("stream closed before the second event: $sb")
+                        sb.append(String(buf, 0, n))
+                    }
+                }
+            } // socket is closed here with an RST; the backend keeps producing
+
+            // The backend keeps streaming for ~600ms after the connection is gone,
+            // so the proxy is guaranteed to attempt writes into it.
+            delay(1_000)
+
+            val events = synchronized(captured) { captured.list.toList() }
+            assertTrue(
+                events.any { it.level == Level.WARN && it.formattedMessage.contains("lost after") },
+                "a connection lost mid-stream should be logged as a WARN naming the request, got: ${events.map { it.formattedMessage }}",
+            )
+            assertTrue(
+                events.none { it.level == Level.ERROR },
+                "a lost connection must not be logged as a proxy error, got: ${events.filter { it.level == Level.ERROR }}",
+            )
+
+            // The loss must not have marked the backend ASLEEP (no re-wake) and
+            // must not have wedged the proxy.
+            val client2 = HttpClient(CIO)
+            try {
+                val after = client2.get("http://127.0.0.1:$proxyPort/echo")
+                assertEquals(HttpStatusCode.OK, after.status, "proxy must keep serving after a lost connection")
+                assertEquals(1, wake.calls, "a lost client connection must not flip the backend asleep")
+            } finally {
+                client2.close()
+            }
+        } finally {
+            proxyLogger.detachAppender(captured)
             proxy.stop(100, 500)
             backend.stop()
         }

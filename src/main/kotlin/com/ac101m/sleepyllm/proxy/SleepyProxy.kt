@@ -29,7 +29,11 @@ import io.ktor.server.request.receiveChannel
 import io.ktor.server.request.uri
 import io.ktor.server.response.respond
 import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.ClosedByteChannelException
+import io.ktor.util.cio.ChannelWriteException
+import kotlinx.coroutines.CancellationException
 import org.slf4j.LoggerFactory
+import java.io.IOException
 import java.net.SocketException
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
@@ -80,15 +84,28 @@ class SleepyProxy(
     suspend fun handle(call: ApplicationCall) {
         if (tryServeCachedModels(call)) return
 
+        val wakeStarted = System.nanoTime()
         if (!lifecycle.awaitReady()) {
             logger.warn(
                 "rejecting {} {}: backend is asleep and could not be woken in time",
                 call.request.httpMethod,
                 call.request.uri,
             )
-            return call.respond(
-                HttpStatusCode.ServiceUnavailable,
-                RESPONSE_UNAVAILABLE,
+            // The client may have disconnected while we held the request for the
+            // whole wake window; a 503 into a dead socket would throw and be logged
+            // as a second failure, so it is best-effort.
+            runCatching {
+                call.respond(HttpStatusCode.ServiceUnavailable, RESPONSE_UNAVAILABLE)
+            }
+            return
+        }
+        val wakeWaitMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - wakeStarted)
+        if (wakeWaitMs > 1_000) {
+            logger.info(
+                "held {} {} {}ms while waking the backend",
+                call.request.httpMethod,
+                call.request.uri,
+                wakeWaitMs,
             )
         }
 
@@ -110,6 +127,32 @@ class SleepyProxy(
                     TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
                 )
             }
+        } catch (e: CancellationException) {
+            // The request was cancelled (e.g. the client hung up) — normal control
+            // flow, not a proxy failure; let the framework unwind the call.
+            throw e
+        } catch (e: ClientDisconnected) {
+            // The client-side connection closed before or while we streamed the
+            // response. That is not necessarily the client walking away: a read
+            // that dies mid-stream can equally be a network drop (the client
+            // blames us — an ECONNRESET — precisely because our teardown of the
+            // dead channel is what emits the RST), or a keep-alive connection the
+            // engine closed of its own accord. There is nobody left to receive a
+            // status either way, so this is an abandoned request, not a proxy
+            // failure. Log one line even when per-request logging is off (WARN,
+            // no stack) so a quiet log still shows the cadence of drops: how long
+            // each response had been streaming when the connection vanished, and
+            // from where. Clustered durations betray a client-side read timeout;
+            // same-millisecond bursts across several connections betray a single
+            // network-path or proxy-side drop.
+            logger.warn(
+                "connection from {} to {} {} lost after {}ms of forwarding",
+                call.request.local.remoteHost,
+                call.request.httpMethod,
+                call.request.uri,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+            )
+            return
         } catch (t: Throwable) {
             if (isConnectionFailure(t)) {
                 // The backend was believed READY but a forward could not reach it —
@@ -131,10 +174,14 @@ class SleepyProxy(
                     t,
                 )
             }
-            return call.respond(
-                HttpStatusCode.BadGateway,
-                "Sleepy LLM could not reach the backend: ${t.message ?: t::class.simpleName}",
-            )
+            // Best-effort: the client may have gone away while this failed, in which
+            // case this write throws too and is not ours to report.
+            runCatching {
+                call.respond(
+                    HttpStatusCode.BadGateway,
+                    "Sleepy LLM could not reach the backend: ${t.message ?: t::class.simpleName}",
+                )
+            }
         }
     }
 
@@ -247,15 +294,70 @@ class SleepyProxy(
                 response.bodyAsChannel()
             }
 
-            call.respond(object : OutgoingContent.ReadChannelContent() {
-                override val status: HttpStatusCode = response.status
-                override val headers: Headers = response.headers.copyExcluding(excludedResponseHeaders)
-                override fun readFrom(): ByteReadChannel = responseBody
-            })
+            streamToClient(call, response.status, response.headers.copyExcluding(excludedResponseHeaders), responseBody)
             upstreamStatus = response.status
         }
         return upstreamStatus
     }
+
+    /**
+     * Writes a forwarded response body to the client. Once the backend has produced
+     * the full response, a failure writing downstream can only mean the client-side
+     * connection is gone — it was closed or reset mid-stream. That close is
+     * translated into [ClientDisconnected] for [handle] to treat as an abandoned
+     * request rather than a proxy error.
+     *
+     * Only the closed-channel family is classified this way: a [SocketException]
+     * on the read side (the *backend* dying mid-stream) would otherwise be masked,
+     * losing a legitimate down-detection signal — it is rethrown as-is so [handle]'s
+     * connection-failure path still flips the backend ASLEEP.
+     */
+    private suspend fun streamToClient(
+        call: ApplicationCall,
+        status: HttpStatusCode,
+        headers: Headers,
+        body: ByteReadChannel,
+    ) {
+        try {
+            call.respond(object : OutgoingContent.ReadChannelContent() {
+                override val status: HttpStatusCode = status
+                override val headers: Headers = headers
+                override fun readFrom(): ByteReadChannel = body
+            })
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            if (isClientGone(t)) throw ClientDisconnected(t)
+            throw t
+        }
+    }
+
+    /**
+     * Whether [t] (or its cause chain) is a write to an already-closed client
+     * channel: the client closed its connection, so there is nobody to receive the
+     * rest of the response. Covers Ktor's [io.ktor.utils.io.ClosedByteChannelException],
+     * the [java.nio.channels.ClosedChannelException] family raised for a closed
+     * channel (Netty's `StacklessClosedChannelException` — what a closed socket
+     * surfaces as — extends it), and Ktor's write wrapper around them.
+     */
+    private fun isClientGone(t: Throwable): Boolean {
+        var current: Throwable? = t
+        while (current != null) {
+            if (current is io.ktor.utils.io.ClosedByteChannelException) return true
+            if (current is java.nio.channels.ClosedChannelException) return true
+            if (current is ChannelWriteException) return true
+            current = current.cause
+        }
+        return false
+    }
+
+    /**
+     * Marker for a request whose client-side connection closed before or during
+     * the response write. [handle] catches it, logs one WARN line naming the
+     * request, the peer, and how long it had been streaming, then returns without
+     * trying to reach a connection that is gone.
+     */
+    private class ClientDisconnected(cause: Throwable) : IOException("client disconnected", cause)
 
     /**
      * Reads a forwarded `/v1/models` response fully and refreshes the disk cache
