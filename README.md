@@ -12,7 +12,14 @@ Full disclosure: This project was almost entirely vibe-coded using a local insta
 
 - **Reverse proxy**: application-level proxy that forwards every method, path
   and query string to the backend. Request and response bodies are streamed, so
-  LLM token streaming / SSE passes through unchanged.
+  LLM token streaming / SSE passes through unchanged. Responses are not buffered,
+  and the Netty response-write watchdog is disabled by default
+  (`proxy.response-write-timeout-seconds = 0`): the proxy forwards for as long as
+  the backend needs, so a long prefill is never cut off by the proxy. A finite
+  value would arm a watchdog that closes a connection whose outbound write has
+  stayed pending-and-unflushed for that long — fine as a stuck-write safety net,
+  but it must sit above the worst-case prefill or it kills legitimate long
+  requests mid-stream (Ktor's own engine default of 10 does exactly that).
 - **Wake on demand**: on the first request, a wake signal is sent and the proxy
   polls the backend's health endpoint until it is ready (or times out). Requests
   arriving during a wake share the same in-flight wake — exactly one packet is
@@ -82,7 +89,8 @@ sleepyllm {
   proxy  {
     host = "0.0.0.0", 
     port = 8080, 
-    log-requests = true          # optional; per-request access logging, off by default 
+    log-requests = true          	# optional; per-request access logging, off by default
+    response-write-timeout-seconds = 0  # default: watchdog disabled; if set, value should exceed your expected prefill time.
   }
   backend {
     host = "127.0.0.1", port = 8000

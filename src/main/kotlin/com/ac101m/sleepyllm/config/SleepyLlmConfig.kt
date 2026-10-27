@@ -35,6 +35,18 @@ data class ProxyConfig(
      * steady polling load, so it is off unless explicitly enabled.
      */
     val logRequests: Boolean = false,
+    /**
+     * The Netty engine's response-write timeout, in seconds, applied to every
+     * client-side connection. The engine closes a connection whose outbound write
+     * has stayed pending-and-unflushed for this long; because a streaming response
+     * can legitimately produce no bytes while the backend prefills, a small value
+     * (Ktor's own engine default is 10) kills long-prefill requests mid-stream.
+     * 0 (the default) disables the watchdog: the proxy waits as long as the
+     * backend needs, and dead-backend handling is left to the monitor and the
+     * reactive on-connect-failure path. Set a finite value only if a bounded
+     * stuck-write safety net is wanted.
+     */
+    val responseWriteTimeoutSeconds: Int = 0,
 )
 
 data class BackendConfig(
@@ -127,7 +139,7 @@ object SleepyLlmConfigLoader {
      */
     private val knownKeys: Map<String, Set<String>> = mapOf(
         "" to setOf("proxy", "backend", "wake", "shutdown"),
-        "proxy" to setOf("host", "port", "log-requests"),
+        "proxy" to setOf("host", "port", "log-requests", "response-write-timeout-seconds"),
         "backend" to setOf("scheme", "host", "port", "health", "models-cache-file", "monitor"),
         "backend.health" to setOf("path", "timeout", "poll-interval"),
         "backend.monitor" to setOf("enabled", "interval", "timeout", "failures"),
@@ -167,6 +179,7 @@ object SleepyLlmConfigLoader {
                 host = root.getString("proxy.host"),
                 port = root.getInt("proxy.port"),
                 logRequests = root.getBoolean("proxy.log-requests"),
+                responseWriteTimeoutSeconds = root.getInt("proxy.response-write-timeout-seconds"),
             ),
             backend = BackendConfig(
                 scheme = root.getString("backend.scheme"),
